@@ -1,0 +1,2 @@
+TRADING_MODE = "paper"
+ENABLE_LIVE_TRADING = False
