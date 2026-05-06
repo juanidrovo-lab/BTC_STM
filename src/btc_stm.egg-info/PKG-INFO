@@ -1,3 +1,17 @@
+Metadata-Version: 2.4
+Name: btc-stm
+Version: 0.1.0
+Summary: BTC STM base package
+Author: BTC_STM Team
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: pydantic<3,>=2.8
+Requires-Dist: pydantic-settings<3,>=2.4
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ruff>=0.5; extra == "dev"
+Requires-Dist: mypy>=1.10; extra == "dev"
+
 # BTC_STM
 
 Proyecto base para simulación/estrategia BTC STM.
