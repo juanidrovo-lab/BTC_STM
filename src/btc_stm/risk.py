@@ -21,6 +21,27 @@ class RiskManager:
     ) -> RiskDecision:
         reasons: list[str] = []
 
+        if not self._all_finite(
+            [
+                order.quantity,
+                order.price,
+                order.stop_loss,
+                portfolio.equity,
+                portfolio.daily_pnl,
+                filters.price_min,
+                filters.price_max,
+                filters.price_tick_size,
+                filters.qty_min,
+                filters.qty_max,
+                filters.qty_step_size,
+                filters.min_notional,
+            ]
+        ):
+            return RiskDecision(
+                approved=False,
+                reasons=["Order rejected: non-finite numeric value detected."],
+            )
+
         if self.settings.risk_kill_switch:
             reasons.append("Kill switch is enabled.")
 
@@ -40,7 +61,11 @@ class RiskManager:
         if position_notional > Decimal(str(self.settings.risk_max_position_notional)):
             reasons.append("Order rejected: max position notional exceeded.")
 
-        max_risk_cash = portfolio.equity * Decimal(str(self.settings.risk_max_risk_per_trade_pct)) / Decimal("100")
+        max_risk_cash = (
+            portfolio.equity
+            * Decimal(str(self.settings.risk_max_risk_per_trade_pct))
+            / Decimal("100")
+        )
         if order.stop_loss is not None:
             per_unit_risk = abs(order.price - order.stop_loss)
             trade_risk = per_unit_risk * order.quantity
@@ -54,8 +79,14 @@ class RiskManager:
         return RiskDecision(approved=len(reasons) == 0, reasons=reasons)
 
     @staticmethod
-    def _is_multiple(value: Decimal, step: Decimal) -> bool:
-        return (value % step) == 0
+    def _all_finite(values: list[Decimal | None]) -> bool:
+        return all(value is None or value.is_finite() for value in values)
+
+    @staticmethod
+    def _is_aligned_to_minimum(value: Decimal, minimum: Decimal, step: Decimal) -> bool:
+        if step <= 0:
+            return False
+        return (value - minimum) % step == 0
 
     def _validate_price_filter(
         self, order: OrderIntent, filters: SymbolFilters, reasons: list[str]
@@ -63,7 +94,11 @@ class RiskManager:
         if not (filters.price_min <= order.price <= filters.price_max):
             reasons.append("Order rejected: PRICE_FILTER range violation.")
             return
-        if not self._is_multiple(order.price, filters.price_tick_size):
+        if not self._is_aligned_to_minimum(
+            order.price,
+            filters.price_min,
+            filters.price_tick_size,
+        ):
             reasons.append("Order rejected: PRICE_FILTER tick size violation.")
 
     def _validate_lot_size(
@@ -72,7 +107,11 @@ class RiskManager:
         if not (filters.qty_min <= order.quantity <= filters.qty_max):
             reasons.append("Order rejected: LOT_SIZE range violation.")
             return
-        if not self._is_multiple(order.quantity, filters.qty_step_size):
+        if not self._is_aligned_to_minimum(
+            order.quantity,
+            filters.qty_min,
+            filters.qty_step_size,
+        ):
             reasons.append("Order rejected: LOT_SIZE step size violation.")
 
     @staticmethod
