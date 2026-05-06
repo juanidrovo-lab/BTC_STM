@@ -1,4 +1,6 @@
 """BTC_STM package."""
 
-__all__ = ["__version__"]
-__version__ = "0.1.0"
+from btc_stm.settings import Settings, TradingMode, get_settings
+
+__all__ = ["__version__", "Settings", "TradingMode", "get_settings"]
+__version__ = "0.2.0"
