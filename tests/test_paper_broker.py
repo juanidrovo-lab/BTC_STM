@@ -36,6 +36,41 @@ def test_paper_broker_buy_reduces_cash_and_creates_position() -> None:
     assert updated.total_fees_paid == Decimal("0.1")
 
 
+def test_paper_broker_rejects_non_finite_fee_rate() -> None:
+    for value in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+        try:
+            PaperBroker(fee_rate_bps=value)
+        except ValueError as exc:
+            assert "finite decimal" in str(exc)
+        else:
+            raise AssertionError("Expected ValueError")
+
+
+def test_paper_broker_rejects_non_positive_fill_price() -> None:
+    broker = PaperBroker()
+    portfolio = PaperPortfolio(cash_balance=Decimal("1000"))
+
+    updated, report = broker.execute_order(make_order(OrderSide.BUY), portfolio, Decimal("0"))
+
+    assert updated == portfolio
+    assert report.status is ExecutionStatus.REJECTED
+    assert report.reason is not None
+    assert "fill price" in report.reason
+
+
+def test_paper_broker_rejects_non_finite_fill_price() -> None:
+    broker = PaperBroker()
+    portfolio = PaperPortfolio(cash_balance=Decimal("1000"))
+
+    for value in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+        updated, report = broker.execute_order(make_order(OrderSide.BUY), portfolio, value)
+
+        assert updated == portfolio
+        assert report.status is ExecutionStatus.REJECTED
+        assert report.reason is not None
+        assert "finite decimal" in report.reason
+
+
 def test_paper_broker_buy_increases_position_average_entry_price() -> None:
     broker = PaperBroker(fee_rate_bps=Decimal("0"))
     portfolio = PaperPortfolio(

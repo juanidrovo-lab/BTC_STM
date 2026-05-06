@@ -21,12 +21,35 @@ def test_calculate_fee_rejects_negative_inputs() -> None:
         calculate_fee(Decimal("100"), Decimal("-1"))
 
 
+def test_calculate_fee_rejects_non_finite_inputs() -> None:
+    with pytest.raises(ValueError, match="notional"):
+        calculate_fee(Decimal("NaN"), Decimal("10"))
+    with pytest.raises(ValueError, match="notional"):
+        calculate_fee(Decimal("Infinity"), Decimal("10"))
+    with pytest.raises(ValueError, match="fee_rate_bps"):
+        calculate_fee(Decimal("100"), Decimal("-Infinity"))
+
+
 def test_apply_slippage_increases_price_for_buy() -> None:
     assert apply_slippage(Decimal("100"), OrderSide.BUY, Decimal("25")) == Decimal("100.25")
 
 
 def test_apply_slippage_reduces_price_for_sell() -> None:
     assert apply_slippage(Decimal("100"), OrderSide.SELL, Decimal("25")) == Decimal("99.75")
+
+
+def test_apply_slippage_rejects_non_finite_inputs() -> None:
+    with pytest.raises(ValueError, match="price"):
+        apply_slippage(Decimal("NaN"), OrderSide.BUY, Decimal("10"))
+    with pytest.raises(ValueError, match="price"):
+        apply_slippage(Decimal("Infinity"), OrderSide.BUY, Decimal("10"))
+    with pytest.raises(ValueError, match="slippage_bps"):
+        apply_slippage(Decimal("100"), OrderSide.BUY, Decimal("-Infinity"))
+
+
+def test_apply_slippage_rejects_non_positive_sell_result() -> None:
+    with pytest.raises(ValueError, match="non-positive final price"):
+        apply_slippage(Decimal("100"), OrderSide.SELL, Decimal("10000"))
 
 
 def test_fill_rejects_non_positive_price_and_quantity() -> None:

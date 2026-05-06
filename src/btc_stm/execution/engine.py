@@ -23,6 +23,8 @@ class PaperExecutionEngine:
         broker: PaperBroker | None = None,
         slippage_bps: Decimal = Decimal("0"),
     ) -> None:
+        if not slippage_bps.is_finite():
+            raise ValueError("slippage_bps must be a finite decimal")
         if slippage_bps < 0:
             raise ValueError("slippage_bps must be greater than or equal to zero")
         self.settings = settings
@@ -43,6 +45,16 @@ class PaperExecutionEngine:
             return paper_portfolio, self._rejected_report(
                 order=order,
                 reason="Order rejected: paper execution engine only supports paper mode.",
+            )
+        if not market_price.is_finite():
+            return paper_portfolio, self._rejected_report(
+                order=order,
+                reason="Order rejected: market price must be a finite decimal.",
+            )
+        if market_price <= 0:
+            return paper_portfolio, self._rejected_report(
+                order=order,
+                reason="Order rejected: market price must be greater than zero.",
             )
 
         risk_decision = self.risk_manager.evaluate(

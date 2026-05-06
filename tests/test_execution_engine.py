@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from btc_stm.domain import OrderIntent, OrderSide, OrderType, PortfolioState, SymbolFilters
 from btc_stm.execution.engine import PaperExecutionEngine
-from btc_stm.execution.models import ExecutionStatus, PaperPortfolio
+from btc_stm.execution.models import ExecutionReport, ExecutionStatus, PaperPortfolio
 from btc_stm.execution.paper_broker import PaperBroker
 from btc_stm.risk import RiskManager
 from btc_stm.settings import Settings, TradingMode
@@ -39,6 +39,24 @@ def make_engine(settings: Settings | None = None) -> PaperExecutionEngine:
         risk_manager=RiskManager(settings),
         broker=PaperBroker(fee_rate_bps=Decimal("0")),
         slippage_bps=Decimal("10"),
+    )
+
+
+def execute_with_market_price(
+    engine: PaperExecutionEngine,
+    market_price: Decimal,
+) -> tuple[PaperPortfolio, ExecutionReport]:
+    portfolio = PaperPortfolio(cash_balance=Decimal("1000"))
+    return engine.execute_order(
+        order=make_order(),
+        paper_portfolio=portfolio,
+        risk_portfolio=PortfolioState(
+            equity=Decimal("1000"),
+            daily_pnl=Decimal("0"),
+            open_positions=0,
+        ),
+        filters=make_filters(),
+        market_price=market_price,
     )
 
 
@@ -114,3 +132,42 @@ def test_paper_execution_engine_rejects_live_mode() -> None:
     assert report.status is ExecutionStatus.REJECTED
     assert report.reason is not None
     assert "paper mode" in report.reason
+
+
+def test_paper_execution_engine_rejects_non_finite_market_price() -> None:
+    engine = make_engine()
+
+    for value in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+        updated, report = execute_with_market_price(engine, value)
+
+        assert updated == PaperPortfolio(cash_balance=Decimal("1000"))
+        assert report.status is ExecutionStatus.REJECTED
+        assert report.reason is not None
+        assert "market price" in report.reason
+
+
+def test_paper_execution_engine_rejects_non_positive_market_price() -> None:
+    engine = make_engine()
+
+    updated, report = execute_with_market_price(engine, Decimal("0"))
+
+    assert updated == PaperPortfolio(cash_balance=Decimal("1000"))
+    assert report.status is ExecutionStatus.REJECTED
+    assert report.reason is not None
+    assert "market price" in report.reason
+
+
+def test_paper_execution_engine_rejects_non_finite_slippage_bps() -> None:
+    settings = Settings()
+
+    for value in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+        try:
+            PaperExecutionEngine(
+                settings=settings,
+                risk_manager=RiskManager(settings),
+                slippage_bps=value,
+            )
+        except ValueError as exc:
+            assert "finite decimal" in str(exc)
+        else:
+            raise AssertionError("Expected ValueError")

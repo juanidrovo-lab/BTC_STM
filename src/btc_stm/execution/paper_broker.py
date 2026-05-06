@@ -21,6 +21,8 @@ class PaperBroker:
     """Simulates fills and portfolio updates without external connectivity."""
 
     def __init__(self, *, fee_rate_bps: Decimal = Decimal("10"), fee_asset: str = "USDT") -> None:
+        if not fee_rate_bps.is_finite():
+            raise ValueError("fee_rate_bps must be a finite decimal")
         if fee_rate_bps < 0:
             raise ValueError("fee_rate_bps must be greater than or equal to zero")
         self.fee_rate_bps = fee_rate_bps
@@ -32,12 +34,27 @@ class PaperBroker:
         portfolio: PaperPortfolio,
         fill_price: Decimal,
     ) -> tuple[PaperPortfolio, ExecutionReport]:
+        invalid_reason = self._invalid_numeric_reason(order, fill_price)
+        if invalid_reason is not None:
+            return portfolio, self._rejected_report(order=order, reason=invalid_reason)
+
         notional = fill_price * order.quantity
         fee = calculate_fee(notional, self.fee_rate_bps)
 
         if order.side is OrderSide.BUY:
             return self._execute_paper_long(order, portfolio, fill_price, notional, fee)
         return self._execute_paper_exit(order, portfolio, fill_price, notional, fee)
+
+    @staticmethod
+    def _invalid_numeric_reason(order: OrderIntent, fill_price: Decimal) -> str | None:
+        if not fill_price.is_finite():
+            return "Order rejected: fill price must be a finite decimal."
+        if fill_price <= 0:
+            return "Order rejected: fill price must be greater than zero."
+        values = [order.price, order.quantity, order.stop_loss]
+        if not all(value is None or value.is_finite() for value in values):
+            return "Order rejected: non-finite order numeric value detected."
+        return None
 
     def _execute_paper_long(
         self,
