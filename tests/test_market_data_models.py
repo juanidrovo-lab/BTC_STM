@@ -56,6 +56,37 @@ def test_symbol_normalization(raw_symbol: str, expected: str) -> None:
     assert event.symbol == expected
 
 
+def test_order_book_level_allows_zero_quantity() -> None:
+    level = OrderBookLevel(price=Decimal("50000"), quantity=Decimal("0"))
+
+    assert level.quantity == Decimal("0")
+
+
+def test_local_receive_time_allows_documented_clock_skew_tolerance() -> None:
+    event = TradeEvent(
+        symbol="BTCUSDT",
+        trade_id=1,
+        price=Decimal("50000"),
+        quantity=Decimal("0.01"),
+        event_time=now(),
+        local_receive_time=now() - timedelta(seconds=1),
+    )
+
+    assert event.local_receive_time < event.event_time
+
+
+def test_local_receive_time_rejects_values_before_tolerance() -> None:
+    with pytest.raises(ValidationError, match="clock skew tolerance"):
+        TradeEvent(
+            symbol="BTCUSDT",
+            trade_id=1,
+            price=Decimal("50000"),
+            quantity=Decimal("0.01"),
+            event_time=now(),
+            local_receive_time=now() - timedelta(seconds=2),
+        )
+
+
 def test_order_book_snapshot_rejects_empty_book() -> None:
     with pytest.raises(ValidationError):
         OrderBookSnapshot(
