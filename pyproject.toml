@@ -4,14 +4,40 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "btc-stm"
-version = "0.1.0"
+version = "0.2.0"
 description = "BTC STM base package"
 readme = "README.md"
-requires-python = ">=3.10"
-authors = [{name = "BTC_STM Team"}]
+requires-python = ">=3.12"
+authors = [{ name = "BTC_STM Team" }]
 
-dependencies = []
+dependencies = [
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.3,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9",
+  "ruff>=0.5,<1",
+  "mypy>=1.10,<2",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+
