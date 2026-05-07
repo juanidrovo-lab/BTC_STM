@@ -53,6 +53,28 @@ class RecordingStrategy:
         )
 
 
+class FutureTimestampStrategy:
+    name = "future_timestamp"
+
+    def on_bar(self, context: StrategyContext) -> StrategyDecision:
+        return StrategyDecision(
+            strategy_name=self.name,
+            timestamp=context.current_bar.open_time + timedelta(minutes=1),
+            orders=[make_order()],
+        )
+
+
+class PastTimestampStrategy:
+    name = "past_timestamp"
+
+    def on_bar(self, context: StrategyContext) -> StrategyDecision:
+        return StrategyDecision(
+            strategy_name=self.name,
+            timestamp=context.current_bar.open_time - timedelta(minutes=1),
+            orders=[make_order()],
+        )
+
+
 def test_strategy_runner_does_not_deliver_future_bars() -> None:
     start = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
     strategy = RecordingStrategy()
@@ -73,6 +95,23 @@ def test_strategy_runner_converts_orders_to_scheduled_orders() -> None:
 
     assert len(result.scheduled_orders) == 1
     assert result.scheduled_orders[0].execute_at == start
+
+
+def test_strategy_runner_uses_decision_timestamp_for_scheduled_orders() -> None:
+    start = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+    result = StrategyRunner(
+        strategy=FutureTimestampStrategy(),
+        symbol="BTCUSDT",
+    ).run([make_bar(start), make_bar(start + timedelta(minutes=1))])
+
+    assert result.scheduled_orders[0].execute_at == start + timedelta(minutes=1)
+
+
+def test_strategy_runner_rejects_decision_timestamp_before_current_bar() -> None:
+    start = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+
+    with pytest.raises(ValueError, match="timestamp"):
+        StrategyRunner(strategy=PastTimestampStrategy(), symbol="BTCUSDT").run([make_bar(start)])
 
 
 def test_strategy_runner_rejects_order_symbol_mismatch() -> None:

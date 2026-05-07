@@ -34,11 +34,11 @@ class StrategyRunner:
                 history=list(history),
             )
             decision = self.strategy.on_bar(context)
-            self._validate_decision(decision)
+            self._validate_decision(decision, context)
             decisions.append(decision)
             for order in decision.orders:
                 scheduled_orders.append(
-                    ScheduledOrder(execute_at=bar.open_time, order=order)
+                    ScheduledOrder(execute_at=decision.timestamp, order=order)
                 )
 
         return StrategyRunResult(
@@ -47,7 +47,13 @@ class StrategyRunner:
             decisions=decisions,
         )
 
-    def _validate_decision(self, decision: StrategyDecision) -> None:
+    def _validate_decision(
+        self,
+        decision: StrategyDecision,
+        context: StrategyContext,
+    ) -> None:
+        if decision.timestamp < context.current_bar.open_time:
+            raise ValueError("Strategy decision timestamp must not be before current bar.")
         for order in decision.orders:
             if order.symbol != self.symbol:
                 raise ValueError("Strategy order symbol must match runner symbol.")
