@@ -43,11 +43,23 @@ class BacktestEngine:
     ) -> BacktestResult:
         if self.settings.trading_mode is not TradingMode.PAPER:
             raise ValueError("BacktestEngine only supports paper mode.")
+        self._validate_symbols(
+            config=config,
+            data_feed=data_feed,
+            scheduled_orders=scheduled_orders,
+        )
 
         portfolio = PaperPortfolio(cash_balance=config.initial_cash)
         trades: list[BacktestTrade] = []
         equity_curve: list[EquityPoint] = []
-        pending_orders = sorted(scheduled_orders, key=lambda scheduled: scheduled.execute_at)
+        pending_orders = sorted(
+            (
+                scheduled
+                for scheduled in scheduled_orders
+                if data_feed.first_timestamp <= scheduled.execute_at <= data_feed.last_timestamp
+            ),
+            key=lambda scheduled: scheduled.execute_at,
+        )
         next_order_index = 0
         execution_engine = PaperExecutionEngine(
             settings=self.settings,
@@ -57,8 +69,9 @@ class BacktestEngine:
         )
 
         for bar in data_feed:
-            market_price = bar.open if config.execute_on == "open" else bar.close
-            current_equity = self._calculate_equity(portfolio, config.symbol, bar.close)
+            execution_price = bar.open if config.execute_on == "open" else bar.close
+            risk_mark_price = execution_price
+            current_equity = self._calculate_equity(portfolio, config.symbol, risk_mark_price)
 
             while (
                 next_order_index < len(pending_orders)
@@ -71,12 +84,16 @@ class BacktestEngine:
                     paper_portfolio=portfolio,
                     risk_portfolio=risk_portfolio,
                     filters=self.filters,
-                    market_price=market_price,
+                    market_price=execution_price,
                 )
                 trades.append(
                     BacktestTrade(timestamp=bar.open_time, execution_report=report)
                 )
-                current_equity = self._calculate_equity(portfolio, config.symbol, bar.close)
+                current_equity = self._calculate_equity(
+                    portfolio,
+                    config.symbol,
+                    risk_mark_price,
+                )
                 next_order_index += 1
 
             equity_curve.append(self._build_equity_point(portfolio, config.symbol, bar))
@@ -95,6 +112,22 @@ class BacktestEngine:
             equity_curve=equity_curve,
             metrics=metrics,
         )
+
+    def _validate_symbols(
+        self,
+        *,
+        config: BacktestConfig,
+        data_feed: HistoricalDataFeed,
+        scheduled_orders: list[ScheduledOrder],
+    ) -> None:
+        if self.filters.symbol != config.symbol:
+            raise ValueError("Symbol mismatch between backtest config and filters.")
+        for bar in data_feed:
+            if bar.symbol != config.symbol:
+                raise ValueError("Symbol mismatch between backtest config and data feed.")
+        for scheduled_order in scheduled_orders:
+            if scheduled_order.order.symbol != config.symbol:
+                raise ValueError("Symbol mismatch between backtest config and scheduled order.")
 
     @staticmethod
     def _build_risk_portfolio(
