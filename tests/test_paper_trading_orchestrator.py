@@ -193,6 +193,57 @@ def test_orchestrator_schedules_orders_with_decision_timestamp() -> None:
     assert result.execution_reports[0].status is ExecutionStatus.FILLED
 
 
+def test_orchestrator_does_not_execute_order_generated_on_same_bar() -> None:
+    start = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
+    strategy = RecordingStrategy(order=make_order())
+
+    result = make_orchestrator(strategy).run(make_config(), [make_bar(start)])
+
+    assert result.execution_reports == []
+    assert any(
+        event.event_type is OrchestratorEventType.ORDER_SCHEDULED
+        for event in result.events
+    )
+    assert not any(
+        event.event_type is OrchestratorEventType.ORDER_EXECUTED
+        for event in result.events
+    )
+
+
+def test_orchestrator_executes_first_bar_order_on_second_bar() -> None:
+    start = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
+    strategy = RecordingStrategy(order=make_order())
+    bars = [make_bar(start), make_bar(start + timedelta(minutes=1), close_price=Decimal("110"))]
+
+    result = make_orchestrator(strategy).run(make_config(), bars)
+
+    assert len(result.execution_reports) == 1
+    assert result.execution_reports[0].status is ExecutionStatus.FILLED
+    assert result.execution_reports[0].average_fill_price == Decimal("110")
+    executed_event = next(
+        event for event in result.events if event.event_type is OrchestratorEventType.ORDER_EXECUTED
+    )
+    assert executed_event.timestamp == start + timedelta(minutes=1)
+
+
+def test_orchestrator_execute_on_open_uses_next_bar_open_without_future_close() -> None:
+    start = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
+    strategy = RecordingStrategy(order=make_order())
+    bars = [
+        make_bar(start, open_price=Decimal("100"), close_price=Decimal("1000")),
+        make_bar(
+            start + timedelta(minutes=1),
+            open_price=Decimal("95"),
+            close_price=Decimal("95"),
+        ),
+    ]
+
+    result = make_orchestrator(strategy).run(make_config(execute_on="open"), bars)
+
+    assert len(result.execution_reports) == 1
+    assert result.execution_reports[0].average_fill_price == Decimal("95")
+
+
 def test_orchestrator_rejects_decision_timestamp_before_current_bar() -> None:
     start = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
 
@@ -222,8 +273,9 @@ def test_orchestrator_rejects_orders_with_symbol_mismatch() -> None:
 def test_orchestrator_executes_paper_buy_and_records_filled_report() -> None:
     start = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
     strategy = RecordingStrategy(order=make_order())
+    bars = [make_bar(start), make_bar(start + timedelta(minutes=1))]
 
-    result = make_orchestrator(strategy).run(make_config(), [make_bar(start)])
+    result = make_orchestrator(strategy).run(make_config(), bars)
 
     assert result.execution_reports[0].status is ExecutionStatus.FILLED
     assert result.performance_report.trades.filled_reports == 1
@@ -236,15 +288,16 @@ def test_orchestrator_executes_paper_buy_and_records_filled_report() -> None:
 def test_orchestrator_records_order_rejected_when_risk_manager_rejects() -> None:
     start = datetime(2026, 5, 8, 12, 0, tzinfo=UTC)
     strategy = RecordingStrategy(order=make_order(quantity=Decimal("200")))
+    bars = [make_bar(start), make_bar(start + timedelta(minutes=1))]
 
-    result = make_orchestrator(strategy).run(make_config(), [make_bar(start)])
+    result = make_orchestrator(strategy).run(make_config(), bars)
 
     assert result.execution_reports[0].status is ExecutionStatus.REJECTED
     assert result.performance_report.trades.rejected_reports == 1
-    assert any(
-        event.event_type is OrchestratorEventType.ORDER_REJECTED
-        for event in result.events
+    rejected_event = next(
+        event for event in result.events if event.event_type is OrchestratorEventType.ORDER_REJECTED
     )
+    assert rejected_event.timestamp == start + timedelta(minutes=1)
 
 
 def test_orchestrator_generates_equity_curve_and_performance_report() -> None:
@@ -256,7 +309,7 @@ def test_orchestrator_generates_equity_curve_and_performance_report() -> None:
 
     assert len(result.equity_curve) == len(bars)
     assert isinstance(result.performance_report, PerformanceReport)
-    assert result.equity_curve[-1].equity == Decimal("10010")
+    assert result.performance_report.equity.ending_equity == Decimal("10000")
 
 
 def test_orchestrator_records_session_completed_and_core_events() -> None:

@@ -94,6 +94,7 @@ class PaperTradingOrchestrator:
         equity_curve: list[EquityPoint] = []
 
         for bar in data_feed:
+            market_price = bar.open if config.execute_on == "open" else bar.close
             events.append(
                 make_event(
                     OrchestratorEventType.BAR_RECEIVED,
@@ -101,6 +102,16 @@ class PaperTradingOrchestrator:
                     message="Bar received.",
                     metadata={"symbol": bar.symbol},
                 )
+            )
+            portfolio = self._execute_due_orders(
+                config=config,
+                bar=bar,
+                market_price=market_price,
+                portfolio=portfolio,
+                scheduled_orders=scheduled_orders,
+                execution_engine=execution_engine,
+                execution_reports=execution_reports,
+                events=events,
             )
             history.append(bar)
             context = StrategyContext(
@@ -125,18 +136,6 @@ class PaperTradingOrchestrator:
                 data_feed=data_feed,
                 decision=decision,
                 scheduled_orders=scheduled_orders,
-                events=events,
-            )
-
-            market_price = bar.open if config.execute_on == "open" else bar.close
-            portfolio = self._execute_due_orders(
-                config=config,
-                bar=bar,
-                market_price=market_price,
-                portfolio=portfolio,
-                scheduled_orders=scheduled_orders,
-                execution_engine=execution_engine,
-                execution_reports=execution_reports,
                 events=events,
             )
             equity_point = self._build_equity_point(portfolio, config.symbol, bar)
