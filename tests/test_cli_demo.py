@@ -24,6 +24,22 @@ def test_run_demo_paper_session_persists_result(tmp_path: Path) -> None:
     assert (tmp_path / manifest.artifact_paths["manifest"]).exists()
 
 
+def test_run_demo_paper_session_uses_overwrite_false_by_default(tmp_path: Path) -> None:
+    run_demo_paper_session(tmp_path, "demo-1")
+
+    with pytest.raises(FileExistsError):
+        run_demo_paper_session(tmp_path, "demo-1")
+
+
+def test_run_demo_paper_session_allows_overwrite_true(tmp_path: Path) -> None:
+    run_demo_paper_session(tmp_path, "demo-1")
+
+    manifest, result = run_demo_paper_session(tmp_path, "demo-1", overwrite=True)
+
+    assert manifest.session_id == "demo-1"
+    assert len(result.equity_curve) == 3
+
+
 def test_run_demo_paper_session_sanitizes_session_id(tmp_path: Path) -> None:
     manifest, _result = run_demo_paper_session(tmp_path, "../bad session")
 

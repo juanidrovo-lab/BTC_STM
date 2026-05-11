@@ -44,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     paper_run_parser = demo_subparsers.add_parser("paper-run")
     paper_run_parser.add_argument("--base-dir", required=True)
     paper_run_parser.add_argument("--session-id", required=True)
+    paper_run_parser.add_argument("--overwrite", action="store_true")
     paper_run_parser.set_defaults(handler=command_demo_paper_run)
 
     return parser

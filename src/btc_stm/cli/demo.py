@@ -45,6 +45,8 @@ def build_demo_bars(symbol: str = "BTCUSDT") -> list[OHLCVBar]:
 def run_demo_paper_session(
     base_dir: Path,
     session_id: str,
+    *,
+    overwrite: bool = False,
 ) -> tuple[SessionManifest, PaperTradingSessionResult]:
     settings = Settings()
     risk_manager = RiskManager(settings)
@@ -68,7 +70,7 @@ def run_demo_paper_session(
         build_demo_bars(symbol),
     )
     manifest = LocalSessionStore(
-        PersistenceConfig(base_dir=base_dir, overwrite=True)
+        PersistenceConfig(base_dir=base_dir, overwrite=overwrite)
     ).save_session(session_id, result)
     return manifest, result
 

@@ -1,8 +1,11 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
+from btc_stm.cli import commands
 from btc_stm.cli.main import run_cli
+from btc_stm.settings import Settings
 
 
 def test_validate_returns_zero_in_safe_paper_mode(capsys: pytest.CaptureFixture[str]) -> None:
@@ -10,6 +13,39 @@ def test_validate_returns_zero_in_safe_paper_mode(capsys: pytest.CaptureFixture[
 
     assert exit_code == 0
     assert "OK: system is in safe paper mode" in capsys.readouterr().out
+
+
+def test_validate_returns_one_when_settings_are_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def raise_validation_error() -> Settings:
+        raise ValidationError.from_exception_data("Settings", [])
+
+    monkeypatch.setattr(commands, "Settings", raise_validation_error)
+
+    exit_code = run_cli(["validate"])
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "ERROR: system settings are invalid or unsafe" in output
+
+
+def test_validate_error_does_not_print_traceback_or_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def raise_runtime_error() -> Settings:
+        raise RuntimeError("api_secret=unsafe")
+
+    monkeypatch.setattr(commands, "Settings", raise_runtime_error)
+
+    exit_code = run_cli(["validate"])
+    output = capsys.readouterr().out.lower()
+
+    assert exit_code == 1
+    assert "traceback" not in output
+    assert "api_secret" not in output
 
 
 def test_sessions_list_empty_base_dir_prints_no_sessions(

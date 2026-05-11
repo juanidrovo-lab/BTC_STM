@@ -31,6 +31,52 @@ def test_demo_paper_run_creates_session_and_sessions_list_shows_it(
     assert "session_id: demo-1" in list_output
 
 
+def test_demo_paper_run_does_not_overwrite_by_default(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = [
+        "demo",
+        "paper-run",
+        "--base-dir",
+        str(tmp_path),
+        "--session-id",
+        "demo-1",
+    ]
+    assert run_cli(args) == 0
+    capsys.readouterr()
+
+    exit_code = run_cli(args)
+    output = capsys.readouterr().out.lower()
+
+    assert exit_code == 1
+    assert "error: session already exists: demo-1" in output
+    assert "traceback" not in output
+    assert "secret" not in output
+
+
+def test_demo_paper_run_overwrite_flag_allows_overwrite(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = [
+        "demo",
+        "paper-run",
+        "--base-dir",
+        str(tmp_path),
+        "--session-id",
+        "demo-1",
+    ]
+    assert run_cli(args) == 0
+    capsys.readouterr()
+
+    exit_code = run_cli([*args, "--overwrite"])
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "session_id: demo-1" in output
+
+
 def test_sessions_show_displays_summary(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

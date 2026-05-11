@@ -23,7 +23,11 @@ def command_version(_args: argparse.Namespace) -> int:
 
 
 def command_validate(_args: argparse.Namespace) -> int:
-    settings = Settings()
+    try:
+        settings = Settings()
+    except Exception:
+        print("ERROR: system settings are invalid or unsafe")
+        return 1
     if settings.trading_mode is TradingMode.PAPER and not settings.enable_live_trading:
         print("OK: system is in safe paper mode")
         return 0
@@ -56,7 +60,15 @@ def command_sessions_show(args: argparse.Namespace) -> int:
 
 
 def command_demo_paper_run(args: argparse.Namespace) -> int:
-    manifest, result = run_demo_paper_session(Path(args.base_dir), args.session_id)
+    try:
+        manifest, result = run_demo_paper_session(
+            Path(args.base_dir),
+            args.session_id,
+            overwrite=args.overwrite,
+        )
+    except FileExistsError:
+        print(f"ERROR: session already exists: {args.session_id}")
+        return 1
     print(format_demo_result(manifest, result))
     return 0
 
