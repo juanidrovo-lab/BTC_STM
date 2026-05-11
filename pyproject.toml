@@ -16,6 +16,9 @@ dependencies = [
   "pydantic-settings>=2.3,<3",
 ]
 
+[project.scripts]
+btc-stm = "btc_stm.cli.main:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0,<9",
