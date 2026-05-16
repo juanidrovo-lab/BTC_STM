@@ -249,9 +249,14 @@ def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
     )
 
     if provided != stored_secret:
+        from urllib.parse import urlparse  # noqa: PLC0415
         _json_response(req, 403, {
             "detail": "Invalid secret.",
-            "hint": "Pass ?token=SECRET in URL, X-Migration-Secret header, or {\"secret\":\"...\"} body.",
+            "diag_path": req.path,
+            "diag_qs": urlparse(req.path).query,
+            "diag_provided_len": len(provided),
+            "diag_stored_len": len(stored_secret),
+            "diag_header": req.headers.get("X-Migration-Secret", "<none>"),
         })
         return
 
