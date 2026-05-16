@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     risk_max_position_notional: float = Field(default=10_000.0, gt=0.0)
     risk_kill_switch: bool = False
 
+    database_url: str | None = None        # Neon DB connection string
+    persistence_backend: str = "local"     # "local" | "neon"
+
     @model_validator(mode="after")
     def enforce_live_safety(self) -> "Settings":
         if self.trading_mode is TradingMode.LIVE and not self.enable_live_trading:

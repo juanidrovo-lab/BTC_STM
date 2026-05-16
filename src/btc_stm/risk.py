@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 
-from btc_stm.domain import OrderIntent, PortfolioState, RiskDecision, SymbolFilters
+from btc_stm.domain import OrderIntent, OrderSide, PortfolioState, RiskDecision, SymbolFilters
 from btc_stm.settings import Settings
+
+logger = logging.getLogger("btc_stm.risk")
 
 
 class RiskManager:
@@ -26,6 +29,7 @@ class RiskManager:
                 order.quantity,
                 order.price,
                 order.stop_loss,
+                order.take_profit,
                 portfolio.equity,
                 portfolio.daily_pnl,
                 filters.price_min,
@@ -75,6 +79,18 @@ class RiskManager:
         self._validate_price_filter(order, filters, reasons)
         self._validate_lot_size(order, filters, reasons)
         self._validate_min_notional(position_notional, filters, reasons)
+        self._validate_take_profit(order, reasons)
+
+        if reasons:
+            for reason in reasons:
+                logger.warning(
+                    "RISK_REJECTED | symbol=%s side=%s price=%s qty=%s | %s",
+                    order.symbol,
+                    order.side.value,
+                    order.price,
+                    order.quantity,
+                    reason,
+                )
 
         return RiskDecision(approved=len(reasons) == 0, reasons=reasons)
 
@@ -120,3 +136,16 @@ class RiskManager:
     ) -> None:
         if notional < filters.min_notional:
             reasons.append("Order rejected: MIN_NOTIONAL violation.")
+
+    @staticmethod
+    def _validate_take_profit(order: OrderIntent, reasons: list[str]) -> None:
+        if order.take_profit is None:
+            return
+        if order.side == OrderSide.BUY and order.take_profit <= order.price:
+            reasons.append(
+                "Order rejected: BUY take_profit must be above entry price."
+            )
+        elif order.side == OrderSide.SELL and order.take_profit >= order.price:
+            reasons.append(
+                "Order rejected: SELL take_profit must be below entry price."
+            )
