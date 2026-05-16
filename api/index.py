@@ -10,7 +10,9 @@ pyproject.toml: [tool.vercel] entrypoint = "api/index.py"
 
 from __future__ import annotations
 
+import asyncio
 import os
+import subprocess
 import sys
 
 # ── Path fix (must come BEFORE any btc_stm import) ──────────────────────────
@@ -281,3 +283,53 @@ async def run_backtest(request: Request) -> dict:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Backtest failed: {exc}")
+
+
+# ─────────────────────────────────────────────
+# POST /api/migrate  (run Alembic migrations)
+# ─────────────────────────────────────────────
+
+@app.post("/api/migrate", tags=["ops"])
+async def run_migrations(request: Request) -> dict:
+    """Run ``alembic upgrade head`` from inside Vercel (has direct Neon access).
+
+    Protected by ``X-Migration-Secret`` header — set ``MIGRATION_SECRET`` in
+    Vercel → Project Settings → Environment Variables before calling this.
+    """
+    secret = os.environ.get("MIGRATION_SECRET", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="MIGRATION_SECRET env var not set.")
+    if request.headers.get("X-Migration-Secret", "") != secret:
+        raise HTTPException(status_code=403, detail="Invalid or missing X-Migration-Secret header.")
+
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        raise HTTPException(status_code=503, detail="DATABASE_URL not configured.")
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    alembic_ini = os.path.join(project_root, "db", "alembic.ini")
+
+    def _run_alembic() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "alembic", "-c", alembic_ini, "upgrade", "head"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "DATABASE_URL": database_url},
+            cwd=project_root,
+            timeout=60,
+        )
+
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(None, _run_alembic)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Migration timed out after 60 s.")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Migration subprocess error: {exc}")
+
+    return {
+        "status": "ok" if result.returncode == 0 else "error",
+        "returncode": result.returncode,
+        "stdout": result.stdout[-4000:] if result.stdout else "",
+        "stderr": result.stderr[-4000:] if result.stderr else "",
+    }
