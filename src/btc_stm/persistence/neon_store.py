@@ -163,17 +163,21 @@ class NeonSessionStore:
 
         try:
             from sqlalchemy.ext.asyncio import create_async_engine  # noqa: PLC0415
+            from sqlalchemy.pool import NullPool  # noqa: PLC0415
         except ImportError as exc:  # pragma: no cover
             raise ImportError(
                 "SQLAlchemy asyncio extension is not available.  "
                 "Install the [db] extras:\n    pip install btc-stm[db]"
             ) from exc
 
+        # NullPool: each async context creates and immediately closes its own
+        # connection. Required for serverless (Vercel) where persistent
+        # connection pools would exhaust Neon's connection limit across
+        # concurrent cold-start invocations.
         self._engine = create_async_engine(
             database_url,
             echo=False,
-            pool_size=5,
-            max_overflow=10,
+            poolclass=NullPool,
         )
         self._meta = _build_metadata()
         self._sa = sa
