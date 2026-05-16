@@ -5,6 +5,7 @@
 # does not guarantee running `pip install -e .` for local packages.
 # api/index.py adds src/ to sys.path before any btc_stm import.
 fastapi>=0.110,<1
+mangum>=0.17,<1
 anyio>=4.0,<5
 python-multipart>=0.0.9,<1
 httpx>=0.27,<1

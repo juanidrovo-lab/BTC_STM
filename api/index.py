@@ -28,6 +28,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from fastapi import FastAPI, HTTPException, Request
+from mangum import Mangum
 
 # Docs are served at /api/docs so they are reachable through Vercel's
 # /api/(.*) route rule. openapi_url must match for the Swagger UI to load.
@@ -333,3 +334,9 @@ async def run_migrations(request: Request) -> dict:
         "stdout": result.stdout[-4000:] if result.stdout else "",
         "stderr": result.stderr[-4000:] if result.stderr else "",
     }
+
+
+# ── AWS Lambda / Vercel adapter ───────────────────────────────────────────────
+# Mangum wraps the ASGI app so Vercel's @vercel/python runtime (which runs on
+# AWS Lambda) can invoke it via the Lambda handler protocol.
+handler = Mangum(app, lifespan="off")
