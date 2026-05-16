@@ -232,24 +232,26 @@ def _handle_secret_debug(req: "BaseHTTPRequestHandler") -> None:
 
 def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
     import subprocess  # noqa: PLC0415
+    from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
 
-    # Strip whitespace — Vercel dashboard copy-paste often adds trailing newlines
     stored_secret = os.environ.get("MIGRATION_SECRET", "").strip()
     if not stored_secret:
         _json_response(req, 503, {"detail": "MIGRATION_SECRET env var not set."})
         return
 
-    # Accept secret via header OR JSON body (fallback for clients with header issues)
+    # Accept secret via URL query param, header, or JSON body — whichever arrives
+    qs = parse_qs(urlparse(req.path).query)
     body = _read_body(req)
     provided = (
-        req.headers.get("X-Migration-Secret", "").strip()
+        qs.get("token", [""])[0].strip()
+        or req.headers.get("X-Migration-Secret", "").strip()
         or str(body.get("secret", "")).strip()
     )
 
     if provided != stored_secret:
         _json_response(req, 403, {
             "detail": "Invalid secret.",
-            "hint": "Send X-Migration-Secret header OR {\"secret\":\"...\"} in JSON body.",
+            "hint": "Pass ?token=SECRET in URL, X-Migration-Secret header, or {\"secret\":\"...\"} body.",
         })
         return
 
@@ -295,7 +297,7 @@ _ROUTES: dict[tuple[str, str], object] = {
 
 class handler(BaseHTTPRequestHandler):  # noqa: N801
     def _dispatch(self) -> None:
-        path = self.path.split("?")[0]
+        path = self.path.split("?")[0]  # strip QS for routing; handlers read req.path for QS
         key = (self.command, path)
         route_fn = _ROUTES.get(key)
         if route_fn is None:
