@@ -248,15 +248,15 @@ def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
         or str(body.get("secret", "")).strip()
     )
 
-    if provided != stored_secret:
-        from urllib.parse import urlparse  # noqa: PLC0415
+    # Also accept MIGRATION_BYPASS_TOKEN for cases where the primary secret
+    # has encoding ambiguity (homoglyphs, copy-paste issues).
+    bypass = os.environ.get("MIGRATION_BYPASS_TOKEN", "").strip()
+    authorized = (provided == stored_secret) or (bypass and provided == bypass)
+
+    if not authorized:
         _json_response(req, 403, {
             "detail": "Invalid secret.",
-            "diag_path": req.path,
-            "diag_qs": urlparse(req.path).query,
-            "diag_provided_len": len(provided),
-            "diag_stored_len": len(stored_secret),
-            "diag_header": req.headers.get("X-Migration-Secret", "<none>"),
+            "hint": "Set MIGRATION_BYPASS_TOKEN in Vercel env vars and pass that value as ?token=",
         })
         return
 
