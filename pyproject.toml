@@ -22,6 +22,14 @@ dev = [
   "ruff>=0.5,<1",
   "mypy>=1.10,<2",
 ]
+db = [
+  "asyncpg>=0.29,<1",
+  "sqlalchemy[asyncio]>=2.0,<3",
+  "alembic>=1.13,<2",
+]
+api = [
+  "btc-stm[db]",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
