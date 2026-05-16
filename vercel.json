@@ -13,11 +13,5 @@
     "TRADING_MODE": "paper",
     "ENABLE_LIVE_TRADING": "false",
     "PERSISTENCE_BACKEND": "neon"
-  },
-  "crons": [
-    {
-      "path": "/api/paper-trade",
-      "schedule": "* * * * *"
-    }
-  ]
+  }
 }
