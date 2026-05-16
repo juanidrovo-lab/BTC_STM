@@ -3,15 +3,13 @@
   "builds": [
     {
       "src": "api/index.py",
-      "use": "@vercel/python",
-      "config": { "maxLambdaSize": "15mb", "runtime": "python3.12" }
+      "use": "@vercel/python"
     }
   ],
   "routes": [
     { "src": "/api/(.*)", "dest": "api/index.py" }
   ],
   "env": {
-    "TRADING_MODE": "paper",
-    "ENABLE_LIVE_TRADING": "false"
+    "TRADING_MODE": "paper"
   }
 }
