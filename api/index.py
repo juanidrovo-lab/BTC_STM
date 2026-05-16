@@ -1,26 +1,44 @@
 """Single FastAPI entrypoint for Vercel Python runtime.
 
-All /api/* routes are defined here so Vercel has one clear Python
-entrypoint to build and deploy.
+All /api/* routes live here. Vercel's @vercel/python builder bundles the
+project files but does not always install local packages from pyproject.toml,
+so we ensure src/ is on sys.path before any btc_stm import.
 
-Vercel config:  vercel.json  →  builds[0].src = "api/index.py"
+Vercel config:  vercel.json → builds[0].src = "api/index.py"
 pyproject.toml: [tool.vercel] entrypoint = "api/index.py"
 """
 
 from __future__ import annotations
 
-import json
 import os
-from datetime import datetime, timezone
+import sys
+
+# ── Path fix (must come BEFORE any btc_stm import) ──────────────────────────
+# Vercel bundles all project files but may not run `pip install -e .`.
+# Inserting src/ ensures `from btc_stm.xxx import ...` resolves correctly
+# regardless of whether the package was pip-installed or not.
+_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
 
+# Docs are served at /api/docs so they are reachable through Vercel's
+# /api/(.*) route rule. openapi_url must match for the Swagger UI to load.
 app = FastAPI(
     title="BTC-STM API",
     version="0.2.0",
-    description="Paper trading engine — Vercel serverless backend",
+    description=(
+        "Paper trading engine — Vercel serverless backend. "
+        "All financial values are Decimal strings to avoid float precision loss."
+    ),
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
 )
 
 
@@ -28,8 +46,9 @@ app = FastAPI(
 # GET /api/health
 # ─────────────────────────────────────────────
 
-@app.get("/api/health")
+@app.get("/api/health", tags=["ops"])
 async def health() -> dict:
+    """Liveness probe — always returns 200 when the function is reachable."""
     return {
         "status": "ok",
         "service": "btc-stm",
@@ -42,36 +61,42 @@ async def health() -> dict:
 
 # ─────────────────────────────────────────────
 # GET /api/paper-trade  (schema)
-# POST /api/paper-trade (single-tick status)
+# POST /api/paper-trade (session status lookup)
 # ─────────────────────────────────────────────
 
-@app.get("/api/paper-trade")
+@app.get("/api/paper-trade", tags=["trading"])
 async def paper_trade_schema() -> dict:
     return {
         "endpoint": "/api/paper-trade",
         "method": "POST",
-        "body": {"session_id": "string (required)", "symbol": "string (default: BTCUSDT)"},
+        "body": {
+            "session_id": "string (required)",
+            "symbol": "string (default: BTCUSDT)",
+        },
         "response": {"status": "ok", "session_id": "string", "events": "integer"},
     }
 
 
-@app.post("/api/paper-trade")
+@app.post("/api/paper-trade", tags=["trading"])
 async def paper_trade(request: Request) -> dict:
+    """Look up an existing paper trading session from Neon DB."""
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         raise HTTPException(
             status_code=503,
-            detail="DATABASE_URL not configured — set it in Vercel environment variables.",
+            detail=(
+                "DATABASE_URL not configured. "
+                "Add it in Vercel → Project Settings → Environment Variables."
+            ),
         )
 
     try:
         body: dict = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON.")
 
     session_id = str(body.get("session_id", "")).strip()
     symbol = str(body.get("symbol", "BTCUSDT")).strip().upper()
-
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id is required.")
 
@@ -85,7 +110,9 @@ async def paper_trade(request: Request) -> dict:
                 "status": "ok",
                 "session_id": session_id,
                 "symbol": symbol,
-                "events": manifest.total_events,
+                "total_events": manifest.total_events,
+                "total_trades": manifest.total_execution_reports,
+                "equity_points": manifest.total_equity_points,
             }
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
@@ -99,7 +126,7 @@ async def paper_trade(request: Request) -> dict:
 
 # ─────────────────────────────────────────────
 # GET /api/backtest  (schema)
-# POST /api/backtest (run deterministic backtest)
+# POST /api/backtest (deterministic backtest)
 # ─────────────────────────────────────────────
 
 _BACKTEST_SCHEMA = {
@@ -109,10 +136,13 @@ _BACKTEST_SCHEMA = {
         "initial_cash": "decimal string — e.g. '10000'",
         "fee_rate_bps": "decimal string, optional, default '10'",
         "slippage_bps": "decimal string, optional, default '5'",
+        "execute_on": "'open' | 'close', optional, default 'close'",
         "bars": [
             {
-                "open_time": "ISO-8601 datetime with timezone",
-                "close_time": "ISO-8601 datetime with timezone",
+                "symbol": "string — must match top-level symbol",
+                "interval": "string — e.g. '1m', '1h'",
+                "open_time": "ISO-8601 with timezone — e.g. '2024-01-01T00:00:00+00:00'",
+                "close_time": "ISO-8601 with timezone",
                 "open": "decimal string",
                 "high": "decimal string",
                 "low": "decimal string",
@@ -123,62 +153,78 @@ _BACKTEST_SCHEMA = {
     },
     "response": {
         "status": "ok",
+        "symbol": "string",
+        "bar_count": "integer",
         "metrics": {
             "total_return_pct": "string",
             "max_drawdown_pct": "string",
-            "total_trades": "int",
+            "total_trades": "integer",
             "total_fees_paid": "string",
         },
     },
 }
 
 
-@app.get("/api/backtest")
+@app.get("/api/backtest", tags=["backtesting"])
 async def backtest_schema() -> dict:
+    """Returns the expected request/response shape for POST /api/backtest."""
     return _BACKTEST_SCHEMA
 
 
-@app.post("/api/backtest")
+@app.post("/api/backtest", tags=["backtesting"])
 async def run_backtest(request: Request) -> dict:
+    """Run a deterministic paper-trading backtest over historical bars.
+
+    Uses ``PaperTradingOrchestrator`` with ``NoOpStrategy`` (hold only) so
+    all provided bars are processed and equity curve + metrics are returned.
+    Swap ``NoOpStrategy`` for a custom strategy to get signal-driven results.
+    """
     try:
         body: dict = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON.")
 
     symbol = str(body.get("symbol", "BTCUSDT")).strip().upper()
+    execute_on = str(body.get("execute_on", "close")).strip().lower()
     bars_raw = body.get("bars", [])
 
+    if execute_on not in {"open", "close"}:
+        raise HTTPException(status_code=400, detail="execute_on must be 'open' or 'close'.")
     if not isinstance(bars_raw, list) or len(bars_raw) < 2:
-        raise HTTPException(status_code=400, detail="bars must be an array with at least 2 entries.")
+        raise HTTPException(status_code=400, detail="bars must be a JSON array with ≥ 2 entries.")
 
-    def _dec(v: object) -> Decimal:
+    def _dec(v: object, field: str) -> Decimal:
         try:
             result = Decimal(str(v))
             if not result.is_finite():
                 raise ValueError
             return result
         except (InvalidOperation, ValueError):
-            raise HTTPException(status_code=400, detail=f"Invalid decimal value: {v!r}")
+            raise HTTPException(status_code=400, detail=f"Invalid decimal for '{field}': {v!r}")
 
-    try:
-        initial_cash = _dec(body.get("initial_cash", "10000"))
-        fee_rate_bps = _dec(body.get("fee_rate_bps", "10"))
-        slippage_bps = _dec(body.get("slippage_bps", "5"))
-    except HTTPException:
-        raise
+    initial_cash = _dec(body.get("initial_cash", "10000"), "initial_cash")
+    fee_rate_bps = _dec(body.get("fee_rate_bps", "10"), "fee_rate_bps")
+    slippage_bps = _dec(body.get("slippage_bps", "5"), "slippage_bps")
 
+    # ── Import btc_stm modules (lazy to isolate ImportError from 400/422 errors)
     try:
         from btc_stm.data.models import OHLCVBar  # noqa: PLC0415
-        from btc_stm.backtesting.models import BacktestConfig  # noqa: PLC0415
-        from btc_stm.backtesting.engine import BacktestEngine  # noqa: PLC0415
-        from btc_stm.strategy.examples import NoOpStrategy  # noqa: PLC0415
-        from btc_stm.settings import Settings  # noqa: PLC0415
-        from btc_stm.risk import RiskManager  # noqa: PLC0415
         from btc_stm.domain import SymbolFilters  # noqa: PLC0415
+        from btc_stm.orchestration.models import PaperTradingConfig  # noqa: PLC0415
+        from btc_stm.orchestration.paper_trading import (  # noqa: PLC0415
+            PaperTradingOrchestrator,
+        )
         from btc_stm.persistence.serialization import to_jsonable  # noqa: PLC0415
+        from btc_stm.risk import RiskManager  # noqa: PLC0415
+        from btc_stm.settings import Settings  # noqa: PLC0415
+        from btc_stm.strategy.examples import NoOpStrategy  # noqa: PLC0415
     except ImportError as exc:
-        raise HTTPException(status_code=500, detail=f"Import error: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"btc_stm package import failed: {exc}. Check Vercel build logs.",
+        )
 
+    # ── Parse bars
     try:
         bars = [
             OHLCVBar(
@@ -186,45 +232,50 @@ async def run_backtest(request: Request) -> dict:
                 interval=str(b.get("interval", "1m")),
                 open_time=datetime.fromisoformat(str(b["open_time"])),
                 close_time=datetime.fromisoformat(str(b["close_time"])),
-                open=_dec(b["open"]),
-                high=_dec(b["high"]),
-                low=_dec(b["low"]),
-                close=_dec(b["close"]),
-                volume=_dec(b["volume"]),
+                open=_dec(b["open"], "open"),
+                high=_dec(b["high"], "high"),
+                low=_dec(b["low"], "low"),
+                close=_dec(b["close"], "close"),
+                volume=_dec(b["volume"], "volume"),
             )
             for b in bars_raw
         ]
+    except HTTPException:
+        raise
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid bar data: {exc}")
 
+    # ── Run backtest via PaperTradingOrchestrator (correct public API)
+    try:
         settings = Settings()
-        risk_manager = RiskManager(settings)
-        filters = SymbolFilters(
-            symbol=symbol,
-            price_min=Decimal("0.01"),
-            price_max=Decimal("9999999"),
-            price_tick_size=Decimal("0.01"),
-            qty_min=Decimal("0.00001"),
-            qty_max=Decimal("9000"),
-            qty_step_size=Decimal("0.00001"),
-            min_notional=Decimal("1"),
+        orchestrator = PaperTradingOrchestrator(
+            settings=settings,
+            risk_manager=RiskManager(settings),
+            filters=SymbolFilters(
+                symbol=symbol,
+                price_min=Decimal("0.01"),
+                price_max=Decimal("9999999"),
+                price_tick_size=Decimal("0.01"),
+                qty_min=Decimal("0.00001"),
+                qty_max=Decimal("9000"),
+                qty_step_size=Decimal("0.00001"),
+                min_notional=Decimal("1"),
+            ),
+            strategy=NoOpStrategy(),
         )
-        config = BacktestConfig(
+        config = PaperTradingConfig(
             symbol=symbol,
             initial_cash=initial_cash,
             fee_rate_bps=fee_rate_bps,
             slippage_bps=slippage_bps,
+            execute_on=execute_on,
         )
-        engine = BacktestEngine(
-            settings=settings,
-            risk_manager=risk_manager,
-            filters=filters,
-            strategy=NoOpStrategy(),
-        )
-        result = engine.run(config=config, bars=bars)
+        result = orchestrator.run(config=config, bars=bars)
         return {
             "status": "ok",
             "symbol": symbol,
             "bar_count": len(bars),
-            "metrics": to_jsonable(result.metrics),
+            "metrics": to_jsonable(result.performance_report),
         }
     except HTTPException:
         raise
