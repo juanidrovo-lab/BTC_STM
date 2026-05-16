@@ -215,16 +215,44 @@ def _handle_paper_trade_post(req: "BaseHTTPRequestHandler") -> None:
         _json_response(req, 500, {"detail": str(exc)})
 
 
+def _handle_secret_debug(req: "BaseHTTPRequestHandler") -> None:
+    """Safe diagnostic — shows secret length and first/last char only."""
+    raw = os.environ.get("MIGRATION_SECRET", "")
+    stripped = raw.strip()
+    _json_response(req, 200, {
+        "migration_secret_set": bool(stripped),
+        "raw_len": len(raw),
+        "stripped_len": len(stripped),
+        "first2": stripped[:2] if stripped else "",
+        "last2": stripped[-2:] if stripped else "",
+        "has_leading_whitespace": raw != raw.lstrip(),
+        "has_trailing_whitespace": raw != raw.rstrip(),
+    })
+
+
 def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
     import subprocess  # noqa: PLC0415
 
-    secret = os.environ.get("MIGRATION_SECRET", "")
-    if not secret:
+    # Strip whitespace — Vercel dashboard copy-paste often adds trailing newlines
+    stored_secret = os.environ.get("MIGRATION_SECRET", "").strip()
+    if not stored_secret:
         _json_response(req, 503, {"detail": "MIGRATION_SECRET env var not set."})
         return
-    if req.headers.get("X-Migration-Secret", "") != secret:
-        _json_response(req, 403, {"detail": "Invalid or missing X-Migration-Secret header."})
+
+    # Accept secret via header OR JSON body (fallback for clients with header issues)
+    body = _read_body(req)
+    provided = (
+        req.headers.get("X-Migration-Secret", "").strip()
+        or str(body.get("secret", "")).strip()
+    )
+
+    if provided != stored_secret:
+        _json_response(req, 403, {
+            "detail": "Invalid secret.",
+            "hint": "Send X-Migration-Secret header OR {\"secret\":\"...\"} in JSON body.",
+        })
         return
+
     database_url = os.environ.get("DATABASE_URL", "")
     if not database_url:
         _json_response(req, 503, {"detail": "DATABASE_URL not configured."})
@@ -255,12 +283,13 @@ def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ROUTES: dict[tuple[str, str], object] = {
-    ("GET",  "/api/health"):       _handle_health,
-    ("GET",  "/api/backtest"):     _handle_backtest_get,
-    ("POST", "/api/backtest"):     _handle_backtest_post,
-    ("GET",  "/api/paper-trade"):  _handle_paper_trade_get,
-    ("POST", "/api/paper-trade"):  _handle_paper_trade_post,
-    ("POST", "/api/migrate"):      _handle_migrate_post,
+    ("GET",  "/api/health"):        _handle_health,
+    ("GET",  "/api/secret-debug"):  _handle_secret_debug,
+    ("GET",  "/api/backtest"):      _handle_backtest_get,
+    ("POST", "/api/backtest"):      _handle_backtest_post,
+    ("GET",  "/api/paper-trade"):   _handle_paper_trade_get,
+    ("POST", "/api/paper-trade"):   _handle_paper_trade_post,
+    ("POST", "/api/migrate"):       _handle_migrate_post,
 }
 
 
