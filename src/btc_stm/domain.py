@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class SignalAction(StrEnum):
@@ -43,11 +43,42 @@ class OrderIntent(BaseModel):
     quantity: Decimal = Field(gt=Decimal("0"))
     price: Decimal = Field(gt=Decimal("0"))
     stop_loss: Decimal | None = None
+    take_profit: Decimal | None = None
 
     @field_validator("symbol")
     @classmethod
     def normalize_symbol(cls, value: str) -> str:
         return value.upper().strip()
+
+    @model_validator(mode="after")
+    def validate_take_profit_direction(self) -> "OrderIntent":
+        if self.take_profit is None:
+            return self
+        if self.stop_loss is not None:
+            if self.side == OrderSide.BUY:
+                if not (self.stop_loss < self.price < self.take_profit):
+                    raise ValueError(
+                        f"BUY order requires stop_loss < price < take_profit, "
+                        f"got {self.stop_loss} < {self.price} < {self.take_profit}"
+                    )
+            else:
+                if not (self.take_profit < self.price < self.stop_loss):
+                    raise ValueError(
+                        f"SELL order requires take_profit < price < stop_loss, "
+                        f"got {self.take_profit} < {self.price} < {self.stop_loss}"
+                    )
+        else:
+            if self.side == OrderSide.BUY and self.take_profit <= self.price:
+                raise ValueError(
+                    f"BUY take_profit must be above price, "
+                    f"got take_profit={self.take_profit} <= price={self.price}"
+                )
+            if self.side == OrderSide.SELL and self.take_profit >= self.price:
+                raise ValueError(
+                    f"SELL take_profit must be below price, "
+                    f"got take_profit={self.take_profit} >= price={self.price}"
+                )
+        return self
 
 
 class PortfolioState(BaseModel):

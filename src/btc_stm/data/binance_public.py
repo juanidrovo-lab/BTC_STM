@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import UTC, datetime
+import logging
 import math
 
 import httpx
+
+logger = logging.getLogger("btc_stm.data.binance")
 
 from btc_stm.data.binance_parsers import parse_order_book_snapshot
 from btc_stm.data.models import OHLCVBar, OrderBookDelta, OrderBookSnapshot, TradeEvent
@@ -44,14 +47,27 @@ class BinancePublicClient:
         if limit not in VALID_DEPTH_LIMITS:
             raise ValueError("limit must be one of Binance's valid depth limits.")
         normalized_symbol = normalize_symbol(symbol)
-        response = self._client.get(
-            "/api/v3/depth",
-            params={"symbol": normalized_symbol, "limit": limit},
-        )
-        response.raise_for_status()
+        try:
+            response = self._client.get(
+                "/api/v3/depth",
+                params={"symbol": normalized_symbol, "limit": limit},
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "HTTP_ERROR | symbol=%s status=%s url=%s",
+                normalized_symbol,
+                exc.response.status_code,
+                str(exc.request.url),
+            )
+            raise
+        except httpx.RequestError as exc:
+            logger.error("NETWORK_ERROR | symbol=%s | %s", normalized_symbol, exc)
+            raise
         payload = response.json()
         receive_time = datetime.now(UTC)
         if not isinstance(payload, dict):
+            logger.error("PARSE_ERROR | symbol=%s | depth response is not a JSON object", normalized_symbol)
             raise ValueError("Binance depth response must be a JSON object.")
         return parse_order_book_snapshot(
             symbol=normalized_symbol,

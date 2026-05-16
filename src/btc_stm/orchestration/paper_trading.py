@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
+
+logger = logging.getLogger("btc_stm.orchestration")
 
 from btc_stm.analytics.report import build_performance_report
 from btc_stm.backtesting.data_feed import HistoricalDataFeed
@@ -62,15 +65,13 @@ class PaperTradingOrchestrator:
                 data_feed=data_feed,
                 events=events,
             )
-        except Exception:
-            failure_timestamp = data_feed.first_timestamp
-            events.append(
-                make_event(
-                    OrchestratorEventType.SESSION_FAILED,
-                    timestamp=failure_timestamp,
-                    message="Paper trading session failed.",
-                )
-            )
+        except ValueError as exc:
+            logger.error("SESSION_FAILED | config_error | %s", exc)
+            self._append_failure_event(events, data_feed, str(exc))
+            raise
+        except Exception as exc:
+            logger.error("SESSION_FAILED | unexpected_error | %s", exc, exc_info=True)
+            self._append_failure_event(events, data_feed, str(exc))
             raise
 
     def _run_validated_session(
@@ -170,6 +171,25 @@ class PaperTradingOrchestrator:
             equity_curve=equity_curve,
             performance_report=performance_report,
             events=events,
+        )
+
+    @staticmethod
+    def _append_failure_event(
+        events: list[OrchestratorEvent],
+        data_feed: HistoricalDataFeed,
+        message: str,
+    ) -> None:
+        try:
+            failure_timestamp = data_feed.first_timestamp
+        except Exception:
+            from datetime import UTC, datetime
+            failure_timestamp = datetime.now(UTC)
+        events.append(
+            make_event(
+                OrchestratorEventType.SESSION_FAILED,
+                timestamp=failure_timestamp,
+                message=f"Paper trading session failed: {message}",
+            )
         )
 
     def _validate_session(
@@ -274,9 +294,12 @@ class PaperTradingOrchestrator:
         open_positions = sum(
             1 for position in portfolio.positions.values() if position.quantity > 0
         )
+        # realized_pnl accumulates from PaperBroker on every closed trade.
+        # Serializable from portfolio state → Neon-ready: swap portfolio read
+        # for a DB query when migrating to cloud persistence.
         return PortfolioState(
             equity=current_equity,
-            daily_pnl=Decimal("0"),
+            daily_pnl=portfolio.realized_pnl,
             open_positions=open_positions,
         )
 
