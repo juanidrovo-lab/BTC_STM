@@ -1,24 +1,27 @@
-"""Minimal diagnostic — single FastAPI route, zero btc_stm imports."""
+"""Zero-dependency diagnostic — stdlib only, no pip packages."""
 
 from __future__ import annotations
 
+import json
 import os
 import sys
-
-from fastapi import FastAPI
-from mangum import Mangum
-
-app = FastAPI(title="BTC-STM API", docs_url="/api/docs", openapi_url="/api/openapi.json")
+from http.server import BaseHTTPRequestHandler
 
 
-@app.get("/api/health")
-async def health() -> dict:
-    return {
-        "status": "ok",
-        "python": sys.version,
-        "trading_mode": os.environ.get("TRADING_MODE", "paper"),
-        "db_configured": bool(os.environ.get("DATABASE_URL")),
-    }
+class handler(BaseHTTPRequestHandler):  # noqa: N801
+    def do_GET(self) -> None:  # noqa: N802
+        body = json.dumps({
+            "status": "ok",
+            "python": sys.version,
+            "path": self.path,
+            "trading_mode": os.environ.get("TRADING_MODE", "paper"),
+            "db_configured": bool(os.environ.get("DATABASE_URL")),
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-
-handler = Mangum(app, lifespan="off")
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        pass
