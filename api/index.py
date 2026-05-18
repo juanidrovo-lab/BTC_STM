@@ -231,7 +231,6 @@ def _handle_secret_debug(req: "BaseHTTPRequestHandler") -> None:
 
 
 def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
-    import subprocess  # noqa: PLC0415
     from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
 
     stored_secret = os.environ.get("MIGRATION_SECRET", "").strip()
@@ -267,20 +266,23 @@ def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
 
     alembic_ini = os.path.join(_ROOT, "db", "alembic.ini")
     try:
-        result = subprocess.run(
-            [sys.executable, "-m", "alembic", "-c", alembic_ini, "upgrade", "head"],
-            capture_output=True, text=True,
-            env={**os.environ, "DATABASE_URL": database_url},
-            cwd=_ROOT, timeout=60,
-        )
+        import io  # noqa: PLC0415
+        from alembic import command as alembic_command  # noqa: PLC0415
+        from alembic.config import Config  # noqa: PLC0415
+
+        # Capture alembic log output
+        log_stream = io.StringIO()
+
+        cfg = Config(alembic_ini, stdout=log_stream)
+        cfg.set_main_option("sqlalchemy.url", database_url)
+
+        alembic_command.upgrade(cfg, "head")
+
+        output = log_stream.getvalue()
         _json_response(req, 200, {
-            "status": "ok" if result.returncode == 0 else "error",
-            "returncode": result.returncode,
-            "stdout": result.stdout[-4000:],
-            "stderr": result.stderr[-4000:],
+            "status": "ok",
+            "output": output[-4000:] if output else "Migration completed (no output).",
         })
-    except subprocess.TimeoutExpired:
-        _json_response(req, 504, {"detail": "Migration timed out after 60 s."})
     except Exception as exc:
         _json_response(req, 500, {"detail": f"Migration error: {exc}"})
 
