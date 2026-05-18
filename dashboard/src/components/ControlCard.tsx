@@ -1,10 +1,11 @@
 'use client'
 
 import { GlassCard } from './GlassCard'
-import { Play, Activity, Database, Download, RefreshCw, AlertTriangle } from 'lucide-react'
+import { Play, Activity, Database, Download, RefreshCw, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react'
 import { useState } from 'react'
 
-type ActionColor = 'cyan' | 'emerald' | 'amber' | 'slate'
+type ActionColor  = 'cyan' | 'emerald' | 'amber' | 'slate'
+type ActionStatus = 'idle' | 'loading' | 'ok' | 'error'
 
 interface Action {
   id:      string
@@ -13,16 +14,8 @@ interface Action {
   icon:    React.ElementType
   color:   ActionColor
   danger?: boolean
+  call?:   () => Promise<void>
 }
-
-const actions: Action[] = [
-  { id: 'backtest',  label: 'Run Backtest',    sub: 'Execute strategy simulation', icon: Play,        color: 'cyan'    },
-  { id: 'health',    label: 'Health Check',    sub: 'Ping /api/health endpoint',   icon: Activity,    color: 'emerald' },
-  { id: 'migrate',   label: 'Run Migration',   sub: 'Apply Alembic head schema',   icon: Database,    color: 'cyan'    },
-  { id: 'export',    label: 'Export Data',     sub: 'Download session CSV',         icon: Download,    color: 'emerald' },
-  { id: 'refresh',   label: 'Sync Positions',  sub: 'Reload from Neon DB',          icon: RefreshCw,   color: 'slate'   },
-  { id: 'alert',     label: 'Risk Override',   sub: 'Bypass risk limits (dev)',     icon: AlertTriangle, color: 'amber', danger: true },
-]
 
 const colorMap: Record<ActionColor, { ring: string; icon: string; hover: string }> = {
   cyan:    { ring: 'ring-cyan-500/20',    icon: 'text-cyan-400',    hover: 'hover:bg-cyan-500/10    hover:border-cyan-500/20'    },
@@ -32,12 +25,60 @@ const colorMap: Record<ActionColor, { ring: string; icon: string; hover: string 
 }
 
 export function ControlCard() {
-  const [loading, setLoading] = useState<string | null>(null)
+  const [statuses, setStatuses] = useState<Record<string, ActionStatus>>({})
 
-  const handleAction = (id: string) => {
-    setLoading(id)
-    setTimeout(() => setLoading(null), 1800)
+  function setStatus(id: string, s: ActionStatus) {
+    setStatuses(prev => ({ ...prev, [id]: s }))
   }
+
+  async function run(action: Action) {
+    if (statuses[action.id] === 'loading') return
+    setStatus(action.id, 'loading')
+    try {
+      if (action.call) {
+        await action.call()
+      } else {
+        await new Promise(r => setTimeout(r, 1200))
+      }
+      setStatus(action.id, 'ok')
+    } catch {
+      setStatus(action.id, 'error')
+    }
+    setTimeout(() => setStatus(action.id, 'idle'), 3000)
+  }
+
+  const actions: Action[] = [
+    {
+      id: 'backtest', label: 'Run Backtest', sub: 'Execute strategy simulation',
+      icon: Play, color: 'cyan',
+      call: async () => {
+        const res = await fetch('/api/backtest', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bars: 100 }) })
+        if (!res.ok) throw new Error()
+      },
+    },
+    {
+      id: 'health', label: 'Health Check', sub: 'Ping /api/health endpoint',
+      icon: Activity, color: 'emerald',
+      call: async () => {
+        const res = await fetch('/api/health')
+        if (!res.ok) throw new Error()
+      },
+    },
+    {
+      id: 'migrate', label: 'Run Migration', sub: 'Apply Alembic head schema',
+      icon: Database, color: 'cyan',
+      call: async () => {
+        const res = await fetch('/api/migrate?token=btcstm2026', { method: 'POST' })
+        if (!res.ok) throw new Error()
+      },
+    },
+    {
+      id: 'export',   label: 'Export Data',    sub: 'Download session CSV',     icon: Download,       color: 'emerald' },
+    {
+      id: 'refresh',  label: 'Sync Positions', sub: 'Reload from Neon DB',      icon: RefreshCw,      color: 'slate'   },
+    {
+      id: 'alert',    label: 'Risk Override',  sub: 'Bypass risk limits (dev)', icon: AlertTriangle,  color: 'amber',  danger: true },
+  ]
 
   return (
     <GlassCard glow="emerald" padding={false} className="flex flex-col">
@@ -51,13 +92,16 @@ export function ControlCard() {
 
       {/* Actions grid */}
       <div className="flex-1 grid grid-cols-2 gap-2.5 p-4">
-        {actions.map(({ id, label, sub, icon: Icon, color, danger }) => {
-          const c = colorMap[color]
-          const isLoading = loading === id
+        {actions.map((action) => {
+          const { id, label, sub, icon: Icon, color, danger } = action
+          const c         = colorMap[color]
+          const status    = statuses[id] ?? 'idle'
+          const isLoading = status === 'loading'
+
           return (
             <button
               key={id}
-              onClick={() => handleAction(id)}
+              onClick={() => run(action)}
               disabled={isLoading}
               className={[
                 'group relative flex flex-col items-start gap-2 rounded-xl p-3.5',
@@ -69,7 +113,13 @@ export function ControlCard() {
               ].join(' ')}
             >
               <div className={`flex h-8 w-8 items-center justify-center rounded-lg bg-white/[0.04] ring-1 ${c.ring}`}>
-                <Icon className={`h-4 w-4 transition-transform duration-200 group-hover:scale-110 ${c.icon} ${isLoading ? 'animate-spin' : ''}`} />
+                {status === 'ok' ? (
+                  <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+                ) : status === 'error' ? (
+                  <XCircle className="h-4 w-4 text-red-400" />
+                ) : (
+                  <Icon className={`h-4 w-4 transition-transform duration-200 group-hover:scale-110 ${c.icon} ${isLoading ? 'animate-spin' : ''}`} />
+                )}
               </div>
               <div>
                 <p className="text-xs font-medium text-slate-200 leading-tight">{label}</p>

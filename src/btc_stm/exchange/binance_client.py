@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import os
 import time
 import urllib.parse
 from decimal import Decimal, ROUND_DOWN
@@ -53,18 +52,10 @@ class BinanceOrderClient:
         self._key    = api_key.strip()
         self._secret = api_secret.strip()
         self._base   = BINANCE_TESTNET if testnet else BINANCE_MAINNET
-
-        # Explicit proxy injection — reads HTTPS_PROXY or HTTP_PROXY from env.
-        # Required for static-IP proxy services (e.g. Fixie) so every outbound
-        # request to Binance exits through the whitelisted IP, even if httpx's
-        # trust_env default would pick it up anyway.
-        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-
-        self._http = httpx.Client(
+        self._http   = httpx.Client(
             base_url=self._base,
             headers={"X-MBX-APIKEY": self._key},
             timeout=10.0,
-            **({"proxy": proxy} if proxy else {}),
         )
 
     # ── Factory ─────────────────────────────────────────────────────────────

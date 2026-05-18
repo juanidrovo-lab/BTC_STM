@@ -1,30 +1,59 @@
 'use client'
 
 import { Activity, Zap } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+
+interface TickerData {
+  price: string
+  change: string
+  positive: boolean
+}
 
 export function Header() {
-  const [time, setTime] = useState('')
-  const [btcPrice, setBtcPrice] = useState('67,432.10')
+  const [time, setTime]     = useState('')
+  const [ticker, setTicker] = useState<TickerData>({ price: '—', change: '—', positive: true })
+  const wsRef               = useRef<WebSocket | null>(null)
 
+  // Clock
   useEffect(() => {
-    const tick = () => {
-      const now = new Date()
-      setTime(now.toLocaleTimeString('en-US', { hour12: false }))
-    }
+    const tick = () => setTime(new Date().toLocaleTimeString('en-US', { hour12: false }))
     tick()
     const id = setInterval(tick, 1000)
     return () => clearInterval(id)
   }, [])
 
-  // Simulate price tick
+  // BTC real price — Binance public miniTicker WebSocket (no API key needed)
   useEffect(() => {
-    const id = setInterval(() => {
-      const base = 67432.10
-      const delta = (Math.random() - 0.5) * 80
-      setBtcPrice((base + delta).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }))
-    }, 3000)
-    return () => clearInterval(id)
+    function connect() {
+      const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@miniTicker')
+      wsRef.current = ws
+
+      ws.onmessage = (e) => {
+        try {
+          const d = JSON.parse(e.data)
+          const price    = parseFloat(d.c)
+          const open     = parseFloat(d.o)
+          const pct      = ((price - open) / open) * 100
+          const positive = pct >= 0
+          setTicker({
+            price:    price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+            change:   `${positive ? '+' : ''}${pct.toFixed(2)}%`,
+            positive,
+          })
+        } catch {}
+      }
+
+      ws.onclose = () => {
+        // reconnect after 3s if closed unexpectedly
+        setTimeout(connect, 3000)
+      }
+    }
+
+    connect()
+    return () => {
+      wsRef.current?.close()
+      wsRef.current = null
+    }
   }, [])
 
   return (
@@ -64,9 +93,11 @@ export function Header() {
             <div className="hidden sm:flex items-center gap-2 rounded-lg bg-white/[0.03] border border-white/[0.06] px-3 py-1.5">
               <Zap className="h-3.5 w-3.5 text-amber-400" />
               <span className="text-xs font-mono font-medium text-slate-300">
-                ${btcPrice}
+                {ticker.price === '—' ? '…' : `$${ticker.price}`}
               </span>
-              <span className="text-[10px] text-emerald-400 font-medium">+0.84%</span>
+              <span className={`text-[10px] font-medium ${ticker.positive ? 'text-emerald-400' : 'text-red-400'}`}>
+                {ticker.change}
+              </span>
             </div>
 
             {/* Connected indicator */}
