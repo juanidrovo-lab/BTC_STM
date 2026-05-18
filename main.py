@@ -83,13 +83,10 @@ _loop_state: dict = {
     "ticks":         0,
     "signals":       0,
     "orders_placed": 0,
-    "last_tick_at":  None,   # ISO string UTC
-    "last_price":    None,
-    "last_ema200":   None,
-    "last_trend":    None,   # "BULL" | "BEAR" | "FLAT"
-    "last_gap_pct":  None,
-    "last_signal":   None,   # "BUY_CROSS" | "SELL_CROSS" | null
+    "last_tick_at":  None,
     "last_error":    None,
+    "assets":        [],       # populated from ASSETS_TO_TRADE at loop start
+    "per_symbol":    {},       # symbol → {price, ema200, trend, gap_pct, signal, tick_at}
 }
 
 # ATR multiplier for stop-loss and take-profit (gives exactly 1:2 R:R)
@@ -188,20 +185,16 @@ def _compute_atr14(klines: list) -> float:
 # Strategy loop core
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _strategy_tick() -> None:
+async def _strategy_tick(symbol: str) -> None:
     """
-    One strategy evaluation cycle. Bandwidth budget per tick:
+    One strategy evaluation cycle for a single symbol.
 
-      No signal  → 1 REST call  (~25 KB through Fixie)
-      Signal + paper → 1 REST call
-      Signal + live  → 5 REST calls  (klines + account + lot-info + limit + oco)
-
-    No WebSocket connections are opened at any point.
+    Bandwidth: 1 REST call/tick (~25 KB). Extra calls only on signal + live.
+    No WebSocket connections are ever opened.
     """
     from btc_stm.exchange.binance_client import BinanceAuthError, BinanceOrderClient  # noqa: PLC0415
     from btc_stm.exchange.trade_guard import _ema, _EMA_PERIOD  # noqa: PLC0415
 
-    symbol  = os.environ.get("STRATEGY_SYMBOL", "BTCUSDT")
     live    = await get_live_trading_state()
     testnet = os.environ.get("BINANCE_TESTNET",    "true").lower()  != "false"
 
@@ -242,16 +235,18 @@ async def _strategy_tick() -> None:
     signal     = "BUY_CROSS" if buy_cross else ("SELL_CROSS" if sell_cross else None)
     side       = "BUY" if buy_cross else ("SELL" if sell_cross else None)
 
-    _loop_state.update({
-        "last_tick_at": datetime.now(timezone.utc).isoformat(),
-        "last_price":   round(current, 2),
-        "last_ema200":  round(ema200, 2),
-        "last_trend":   trend,
-        "last_gap_pct": round(gap_pct, 3),
-        "last_signal":  signal,
-        "last_error":   None,
-    })
-    _loop_state["ticks"] += 1
+    tick_at = datetime.now(timezone.utc).isoformat()
+    _loop_state["last_tick_at"] = tick_at
+    _loop_state["last_error"]   = None
+    _loop_state["ticks"]       += 1
+    _loop_state["per_symbol"][symbol] = {
+        "price":    round(current, 2),
+        "ema200":   round(ema200, 2),
+        "trend":    trend,
+        "gap_pct":  round(gap_pct, 3),
+        "signal":   signal,
+        "tick_at":  tick_at,
+    }
 
     tick_msg = (f"[loop] tick {_loop_state['ticks']}: {symbol} @ ${current:.2f} | "
                 f"EMA200={ema200:.2f} | {trend} | gap={gap_pct:+.2f}% | "
@@ -363,36 +358,44 @@ async def _execute_loop_trade(
 
 async def _strategy_loop() -> None:
     """
-    Background task: wakes up once per 1h candle close (UTC-synced),
-    runs one strategy tick, then sleeps until the next candle.
+    Background task: wakes up once per 1h candle close (UTC-synced) and
+    evaluates each asset in ASSETS_TO_TRADE independently.
 
-    Uses only REST API calls — no WebSocket connections are ever opened.
-    Proxy bandwidth consumption: ≈ 25 KB/tick × 24 ticks/day ≈ 600 KB/day.
+    REST-only — no WebSockets.
+    Bandwidth: ≈ 25 KB × n_assets × 24 ticks/day.
     """
+    assets = [
+        s.strip().upper()
+        for s in os.environ.get("ASSETS_TO_TRADE", "BTCUSDT").split(",")
+        if s.strip()
+    ]
     _loop_state["running"] = True
-    log.info("[loop] strategy loop started — waiting for first candle close")
-    await _log_event("INFO", "[loop] strategy loop started (REST-only, 1h interval)")
+    _loop_state["assets"]  = assets
+    log.info("[loop] started — assets: %s", assets)
+    await _log_event("INFO", f"[loop] iniciado — activos: {', '.join(assets)} (REST-only, 1h)")
 
     while True:
         wait = _secs_to_next_candle()
-        log.info("[loop] sleeping %.0f s until next 1h candle close", wait)
+        log.info("[loop] durmiendo %.0f s hasta próximo cierre de vela", wait)
         await asyncio.sleep(wait)
 
-        try:
-            await _strategy_tick()
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            err = f"[loop] unhandled error in tick: {exc}"
-            log.exception(err)
-            _loop_state["last_error"] = str(exc)
+        for symbol in assets:
             try:
-                await _log_event("ERROR", err)
-            except Exception:
-                pass
+                await _strategy_tick(symbol)
+            except asyncio.CancelledError:
+                _loop_state["running"] = False
+                return
+            except Exception as exc:
+                err = f"[loop] error en tick {symbol}: {exc}"
+                log.exception(err)
+                _loop_state["last_error"] = err
+                try:
+                    await _log_event("ERROR", err)
+                except Exception:
+                    pass
 
     _loop_state["running"] = False
-    log.info("[loop] strategy loop stopped")
+    log.info("[loop] detenido")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -577,17 +580,67 @@ async def migrate(request: Request, token: str = ""):
 
 @app.get("/api/strategy/status")
 async def strategy_status():
-    """Current state of the background strategy loop."""
     secs_until_next = _secs_to_next_candle() if _loop_state["running"] else None
     live = await get_live_trading_state()
     return {
         **_loop_state,
         "live_trading":    live,
-        "symbol":          os.environ.get("STRATEGY_SYMBOL", "BTCUSDT"),
         "interval":        "1h",
         "connection_type": "REST-only",
         "next_tick_secs":  round(secs_until_next, 0) if secs_until_next else None,
     }
+
+
+@app.get("/api/analytics/performance")
+async def analytics_performance(symbol: str = "BTCUSDT"):
+    """Métricas de rendimiento: winrate, profit factor, PnL total para un activo."""
+    sym = symbol.strip().upper()
+    try:
+        rows = await db_query("""
+            SELECT
+                COUNT(*)::int                                                                      AS total_trades,
+                COALESCE(SUM(CASE WHEN er.realized_pnl::float >  0 THEN 1 ELSE 0 END), 0)::int   AS winning_trades,
+                COALESCE(SUM(CASE WHEN er.realized_pnl::float <  0 THEN 1 ELSE 0 END), 0)::int   AS losing_trades,
+                COALESCE(SUM(CASE WHEN er.realized_pnl::float >  0 THEN er.realized_pnl::float ELSE 0 END), 0) AS gross_profit,
+                COALESCE(SUM(CASE WHEN er.realized_pnl::float <= 0 THEN ABS(er.realized_pnl::float) ELSE 0 END), 0) AS gross_loss,
+                COALESCE(SUM(er.realized_pnl::float), 0)                                          AS total_pnl
+            FROM execution_reports er
+            WHERE er.symbol = $1
+        """, sym)
+
+        r            = rows[0] if rows else {}
+        total        = int(r.get("total_trades")   or 0)
+        winning      = int(r.get("winning_trades")  or 0)
+        losing       = int(r.get("losing_trades")   or 0)
+        gross_profit = float(r.get("gross_profit")  or 0)
+        gross_loss   = float(r.get("gross_loss")    or 0)
+        total_pnl    = float(r.get("total_pnl")     or 0)
+
+        winrate       = (winning / total * 100) if total > 0 else 0.0
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+        avg_win       = (gross_profit / winning) if winning > 0 else 0.0
+        avg_loss      = -(gross_loss  / losing)  if losing  > 0 else 0.0
+
+        pf_str = f"{profit_factor:.2f}x" if profit_factor != float("inf") else "∞"
+
+        return {
+            "symbol":          sym,
+            "total_trades":    total,
+            "winning_trades":  winning,
+            "losing_trades":   losing,
+            "winrate":         round(winrate, 1),
+            "winrate_str":     f"{winrate:.1f}%",
+            "profit_factor":   round(profit_factor, 2) if profit_factor != float("inf") else None,
+            "profit_factor_str": pf_str,
+            "total_pnl":       round(total_pnl, 2),
+            "avg_win":         round(avg_win, 2),
+            "avg_loss":        round(avg_loss, 2),
+            "gross_profit":    round(gross_profit, 2),
+            "gross_loss":      round(gross_loss, 2),
+            "source":          "neon" if total > 0 else "empty",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/api/strategy/toggle-live")

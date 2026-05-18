@@ -5,14 +5,14 @@ import { Server, CheckCircle2, Circle, AlertTriangle, RefreshCw } from 'lucide-r
 import { useEffect, useState, useCallback } from 'react'
 
 interface HealthData {
-  status: string
-  service: string
-  version: string
-  python: string
-  trading_mode: string
+  status:              string
+  service:             string
+  version:             string
+  python:              string
+  trading_mode:        string
   persistence_backend: string
-  db_configured: boolean
-  ping_ms?: number
+  db_configured:       boolean
+  loop_running:        boolean
 }
 
 const accentMap: Record<string, string> = {
@@ -23,9 +23,9 @@ const accentMap: Record<string, string> = {
 }
 
 export function HealthCard() {
-  const [data, setData]       = useState<HealthData | null>(null)
-  const [pingMs, setPingMs]   = useState<number | null>(null)
-  const [error, setError]     = useState(false)
+  const [data,    setData]    = useState<HealthData | null>(null)
+  const [pingMs,  setPingMs]  = useState<number | null>(null)
+  const [error,   setError]   = useState(false)
   const [loading, setLoading] = useState(true)
 
   const fetchHealth = useCallback(async () => {
@@ -51,17 +51,18 @@ export function HealthCard() {
     return () => clearInterval(id)
   }, [fetchHealth])
 
-  const metrics = data
-    ? [
-        { label: 'Status',      value: data.status === 'ok' ? 'OK' : data.status.toUpperCase(), accent: data.status === 'ok' ? 'emerald' : 'red' },
-        { label: 'Service',     value: data.service,                                              accent: 'cyan'    },
-        { label: 'Version',     value: data.version,                                              accent: undefined },
-        { label: 'Python',      value: data.python,                                               accent: undefined },
-        { label: 'Mode',        value: data.trading_mode.toUpperCase(),                           accent: 'amber'   },
-        { label: 'Persistence', value: data.persistence_backend.toUpperCase(),                    accent: 'cyan'    },
-        { label: 'Database',    value: data.db_configured ? 'Connected' : 'Disconnected',         accent: data.db_configured ? 'emerald' : 'red' },
-      ]
-    : []
+  const modeLabel = (m: string) => m === 'paper' ? 'DEMO' : m.toUpperCase()
+
+  const metrics = data ? [
+    { label: 'Estado',      value: data.status === 'ok' ? 'Operativo' : 'Error',         accent: data.status === 'ok' ? 'emerald' : 'red' },
+    { label: 'Servicio',    value: data.service,                                           accent: 'cyan'    },
+    { label: 'Versión',     value: data.version,                                           accent: undefined },
+    { label: 'Python',      value: data.python,                                            accent: undefined },
+    { label: 'Modo',        value: modeLabel(data.trading_mode),                           accent: 'amber'   },
+    { label: 'Persistencia',value: data.persistence_backend.toUpperCase(),                 accent: 'cyan'    },
+    { label: 'Base de Datos',value: data.db_configured ? 'Conectado' : 'Desconectado',    accent: data.db_configured ? 'emerald' : 'red' },
+    { label: 'Loop Activo', value: data.loop_running   ? 'Corriendo'  : 'Detenido',       accent: data.loop_running   ? 'emerald' : 'amber' },
+  ] : []
 
   const healthy = !error && data?.status === 'ok'
 
@@ -69,7 +70,7 @@ export function HealthCard() {
     <GlassCard glow="emerald" padding={false} className="flex flex-col">
       <div className="flex items-center justify-between p-6 pb-4">
         <div>
-          <p className="label-xs mb-1.5">System Health</p>
+          <p className="label-xs mb-1.5">Estado del Sistema</p>
           <div className="flex items-center gap-2">
             {loading ? (
               <RefreshCw className="h-4 w-4 text-slate-500 animate-spin" />
@@ -79,14 +80,14 @@ export function HealthCard() {
               <AlertTriangle className="h-4 w-4 text-red-400" />
             )}
             <h2 className="text-lg font-medium text-slate-100">
-              {loading ? 'Checking…' : healthy ? 'All Systems Go' : 'Degraded'}
+              {loading ? 'Verificando…' : healthy ? 'Todo Operativo' : 'Degradado'}
             </h2>
           </div>
         </div>
         <button
           onClick={fetchHealth}
           className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10 ring-1 ring-emerald-500/20 hover:bg-emerald-500/20 transition-colors"
-          title="Refresh"
+          title="Actualizar"
         >
           <Server className="h-5 w-5 text-emerald-400" />
         </button>
@@ -97,11 +98,11 @@ export function HealthCard() {
       <div className="flex-1 divide-y divide-white/[0.04] px-2 py-2 overflow-auto">
         {loading && metrics.length === 0 ? (
           <div className="flex items-center justify-center h-full text-xs text-slate-600 py-8">
-            Fetching /api/health…
+            Consultando /api/health…
           </div>
         ) : error ? (
           <div className="flex items-center justify-center h-full text-xs text-red-400 py-8">
-            API unreachable
+            API no disponible
           </div>
         ) : (
           metrics.map(({ label, value, accent }) => (
@@ -127,9 +128,9 @@ export function HealthCard() {
       </div>
 
       <div className="border-t border-white/[0.06] px-6 py-3 flex items-center justify-between">
-        <span className="label-xs">Last ping</span>
+        <span className="label-xs">Última consulta</span>
         <span className="text-xs font-mono text-slate-500">
-          {pingMs !== null ? `${pingMs}ms · Neon IAD1` : '—'}
+          {pingMs !== null ? `${pingMs} ms · Neon IAD1` : '—'}
         </span>
       </div>
     </GlassCard>

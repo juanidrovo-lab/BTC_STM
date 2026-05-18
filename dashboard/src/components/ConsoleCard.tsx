@@ -12,16 +12,15 @@ interface LogLine {
   msg:   string
 }
 
-// Shown while DB has no events yet
 const BOOT_LOGS: LogLine[] = [
-  { ts: '—', level: 'INFO', msg: 'BTC-STM v0.2.0 initializing...' },
-  { ts: '—', level: 'OK',   msg: 'Neon DB connection established' },
-  { ts: '—', level: 'INFO', msg: 'WebSocket: BTCUSDT@kline_1m' },
-  { ts: '—', level: 'INFO', msg: 'Strategy: NoOpStrategy loaded' },
-  { ts: '—', level: 'OK',   msg: 'Paper broker ready — cash: $10,000' },
-  { ts: '—', level: 'INFO', msg: 'Risk manager: MAX_DAILY_LOSS=2.0%' },
-  { ts: '—', level: 'OK',   msg: 'Alembic migration 001 applied' },
-  { ts: '—', level: 'WARN', msg: 'LIVE_TRADING=false — paper mode' },
+  { ts: '—', level: 'INFO', msg: 'BTC-STM v0.3.0 inicializando...' },
+  { ts: '—', level: 'OK',   msg: 'Conexión con Neon DB establecida' },
+  { ts: '—', level: 'INFO', msg: 'Loop de estrategia: REST-only, 1h' },
+  { ts: '—', level: 'INFO', msg: 'Activos: BTCUSDT, ETHUSDT, SOLUSDT' },
+  { ts: '—', level: 'OK',   msg: 'Broker paper listo — capital: $10.000' },
+  { ts: '—', level: 'INFO', msg: 'Gestor de riesgo: MAX_RISK=1% por trade' },
+  { ts: '—', level: 'OK',   msg: 'Migración Alembic 003 aplicada' },
+  { ts: '—', level: 'WARN', msg: 'LIVE_TRADING=false — modo demo activo' },
 ]
 
 const LEVEL_STYLE: Record<LogLevel, string> = {
@@ -38,13 +37,23 @@ function normalizeLevel(l: string): LogLevel {
   return 'INFO'
 }
 
-export function ConsoleCard() {
-  const [logs, setLogs]         = useState<LogLine[]>(BOOT_LOGS)
-  const [fromDB, setFromDB]     = useState(false)
-  const bodyRef                 = useRef<HTMLDivElement>(null)
-  const lastCountRef            = useRef(0)
+const SIMULATED = [
+  'BTCUSDT vela cerrada: A=67380 M=67510 m=67310 C=67432',
+  'GestorRiesgo.evaluar: APROBADO — dentro de límites',
+  'EMA-200=66.891 | tendencia ALCISTA | sin cruce',
+  'Snapshot de equity: $10.843,20 (+8,43%)',
+  'ETHUSDT vela cerrada: A=3.521 M=3.590 m=3.498 C=3.548',
+  'Portfolio PnL: realizado=$843,20 no-realizado=$0,00',
+  'Ping WebSocket: 14 ms',
+  'SOLUSDT: precio $142,30 | EMA200=138,50 | ALCISTA',
+]
 
-  // Scroll container (not page) to bottom on new logs
+export function ConsoleCard() {
+  const [logs,    setLogs]    = useState<LogLine[]>(BOOT_LOGS)
+  const [fromDB,  setFromDB]  = useState(false)
+  const bodyRef               = useRef<HTMLDivElement>(null)
+  const lastCountRef          = useRef(0)
+
   useEffect(() => {
     const el = bodyRef.current
     if (el) el.scrollTop = el.scrollHeight
@@ -61,33 +70,22 @@ export function ConsoleCard() {
         setFromDB(true)
       }
     } catch {
-      // keep current logs
+      // mantener logs actuales
     }
   }, [])
 
-  // Poll /api/logs every 5s; also keep simulated ticks when DB is empty
   useEffect(() => {
     fetchLogs()
-    const pollId = setInterval(fetchLogs, 5_000)
-    return () => clearInterval(pollId)
+    const id = setInterval(fetchLogs, 5_000)
+    return () => clearInterval(id)
   }, [fetchLogs])
 
-  // Simulated live feed only while DB has no real events
   useEffect(() => {
     if (fromDB) return
-    const LIVE = [
-      'BTCUSDT kline closed: O=67380 H=67510 L=67310 C=67432',
-      'RiskManager.evaluate: PASS — within limits',
-      'NoOpStrategy: no signal — holding',
-      'Equity snapshot: $10,843.20 (+8.43%)',
-      'BTCUSDT kline closed: O=67432 H=67590 L=67400 C=67521',
-      'Portfolio PnL: realized=$843.20 unrealized=$0.00',
-      'WebSocket ping: 14ms',
-    ]
     let idx = 0
     const id = setInterval(() => {
-      const now = new Date().toLocaleTimeString('en-US', { hour12: false })
-      setLogs(prev => [...prev.slice(-40), { ts: now, level: 'INFO', msg: LIVE[idx % LIVE.length] }])
+      const now = new Date().toLocaleTimeString('es', { hour12: false })
+      setLogs(prev => [...prev.slice(-40), { ts: now, level: 'INFO', msg: SIMULATED[idx % SIMULATED.length] }])
       idx++
     }, 2800)
     return () => clearInterval(id)
@@ -95,14 +93,13 @@ export function ConsoleCard() {
 
   return (
     <GlassCard glow="cyan" padding={false} className="flex flex-col">
-      {/* Header */}
       <div className="flex items-center justify-between p-4 pb-3">
         <div className="flex items-center gap-2">
           <Terminal className="h-4 w-4 text-cyan-400" />
-          <p className="label-xs">System Console</p>
+          <p className="label-xs">Consola del Sistema</p>
           {fromDB && (
             <span className="text-[9px] font-mono text-emerald-500 bg-emerald-500/10 px-1.5 py-0.5 rounded">
-              LIVE DB
+              BD EN VIVO
             </span>
           )}
         </div>
@@ -113,7 +110,6 @@ export function ConsoleCard() {
         </div>
       </div>
 
-      {/* Terminal body */}
       <div
         ref={bodyRef}
         className="flex-1 overflow-y-auto scrollbar-thin px-4 pb-4 font-mono text-[11px] leading-relaxed"
@@ -130,7 +126,6 @@ export function ConsoleCard() {
         ))}
       </div>
 
-      {/* Prompt line */}
       <div className="border-t border-white/[0.06] px-4 py-2.5 font-mono text-[11px] flex items-center gap-2">
         <span className="text-emerald-400">btc-stm</span>
         <span className="text-slate-600">$</span>
