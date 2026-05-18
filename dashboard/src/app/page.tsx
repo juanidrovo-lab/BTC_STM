@@ -8,7 +8,7 @@ import { ControlCard }   from '@/components/ControlCard'
 export default function Dashboard() {
   return (
     <div className="min-h-screen bg-[#070a13] text-slate-100">
-      {/* Ambient background orbs */}
+      {/* ── Ambient background orbs ──────────────────────────────────────── */}
       <div aria-hidden className="pointer-events-none fixed inset-0 overflow-hidden">
         <div className="absolute -top-48 -left-48 h-[700px] w-[700px] rounded-full bg-cyan-500/[0.07] blur-[120px]" />
         <div className="absolute top-1/3 -right-48 h-[500px] w-[500px] rounded-full bg-cyan-400/[0.05] blur-[100px]" />
@@ -29,48 +29,33 @@ export default function Dashboard() {
           </p>
         </div>
 
-        {/* Bento Grid */}
+        {/* ── Bento Grid ────────────────────────────────────────────────── */}
         <div
           className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4"
           style={{ gridAutoRows: '200px' }}
         >
           {/* Activity Chart — 4 col × 2 row */}
-          <div
-            className="col-span-1 sm:col-span-2 lg:col-span-4 row-span-1 lg:row-span-2 animate-slide-up"
-            style={{ animationDelay: '0ms' }}
-          >
+          <div className="col-span-1 sm:col-span-2 lg:col-span-4 row-span-1 lg:row-span-2 animate-slide-up" style={{ animationDelay: '0ms' }}>
             <ActivityChart />
           </div>
 
-          {/* Health Status — 2 col × 2 row */}
-          <div
-            className="col-span-1 sm:col-span-2 lg:col-span-2 row-span-1 lg:row-span-2 animate-slide-up"
-            style={{ animationDelay: '80ms' }}
-          >
+          {/* Health — 2 col × 2 row */}
+          <div className="col-span-1 sm:col-span-2 lg:col-span-2 row-span-1 lg:row-span-2 animate-slide-up" style={{ animationDelay: '80ms' }}>
             <HealthCard />
           </div>
 
           {/* KPIs — 2 col × 2 row */}
-          <div
-            className="col-span-1 sm:col-span-1 lg:col-span-2 row-span-1 lg:row-span-2 animate-slide-up"
-            style={{ animationDelay: '160ms' }}
-          >
+          <div className="col-span-1 sm:col-span-1 lg:col-span-2 row-span-1 lg:row-span-2 animate-slide-up" style={{ animationDelay: '160ms' }}>
             <KPICard />
           </div>
 
           {/* Console — 2 col × 2 row */}
-          <div
-            className="col-span-1 sm:col-span-1 lg:col-span-2 row-span-1 lg:row-span-2 animate-slide-up"
-            style={{ animationDelay: '240ms' }}
-          >
+          <div className="col-span-1 sm:col-span-1 lg:col-span-2 row-span-1 lg:row-span-2 animate-slide-up" style={{ animationDelay: '240ms' }}>
             <ConsoleCard />
           </div>
 
           {/* Control — 2 col × 2 row */}
-          <div
-            className="col-span-1 sm:col-span-2 lg:col-span-2 row-span-1 lg:row-span-2 animate-slide-up"
-            style={{ animationDelay: '320ms' }}
-          >
+          <div className="col-span-1 sm:col-span-2 lg:col-span-2 row-span-1 lg:row-span-2 animate-slide-up" style={{ animationDelay: '320ms' }}>
             <ControlCard />
           </div>
         </div>

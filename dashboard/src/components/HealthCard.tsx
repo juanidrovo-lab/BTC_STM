@@ -1,3 +1,5 @@
+'use client'
+
 import { GlassCard } from './GlassCard'
 import { Server, CheckCircle2, Circle } from 'lucide-react'
 
