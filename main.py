@@ -199,14 +199,12 @@ async def health():
 # ── Migration ────────────────────────────────────────────────────────────────
 
 @app.post("/api/migrate")
-async def migrate(request: Request):
-    # Auth: ?token= or X-Migration-Secret header
-    from urllib.parse import parse_qs  # noqa: PLC0415
-    qs       = parse_qs(str(request.url.query))
-    token    = (qs.get("token", [""])[0] or request.headers.get("X-Migration-Secret", "")).strip()
-    bypass   = os.environ.get("MIGRATION_BYPASS_TOKEN", "").strip()
-    secret   = os.environ.get("MIGRATION_SECRET", "").strip()
-    authorized = (secret and token == secret) or (bypass and token == bypass)
+async def migrate(request: Request, token: str = ""):
+    # Auth: ?token= query param (FastAPI native) or X-Migration-Secret header
+    provided   = (token or request.headers.get("X-Migration-Secret", "")).strip()
+    bypass     = os.environ.get("MIGRATION_BYPASS_TOKEN", "").strip()
+    secret     = os.environ.get("MIGRATION_SECRET", "").strip()
+    authorized = (secret and provided == secret) or (bypass and provided == bypass)
     if not authorized:
         raise HTTPException(status_code=403, detail="Invalid or missing migration token.")
 
