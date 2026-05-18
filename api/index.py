@@ -353,6 +353,221 @@ def _handle_logs(req: "BaseHTTPRequestHandler") -> None:
         _json_response(req, 500, {"detail": str(exc)})
 
 
+def _db_execute(sql: str, *args: object) -> str:
+    """Run a write statement (INSERT/UPDATE/DELETE); returns command tag."""
+    import asyncio  # noqa: PLC0415
+    import asyncpg  # noqa: PLC0415
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        return "NO_DB"
+    dsn = _normalize_db_url_asyncpg(database_url)
+
+    async def _run() -> str:
+        conn = await asyncpg.connect(dsn)
+        try:
+            return await conn.execute(sql, *args)
+        finally:
+            await conn.close()
+
+    try:
+        return asyncio.run(_run())
+    except Exception:
+        return "ERROR"
+
+
+def _is_system_active() -> bool:
+    """Check Neon DB for kill-switch state; defaults to True when table is absent."""
+    rows = _db_query("SELECT value FROM system_config WHERE key = 'system_active' LIMIT 1")
+    if not rows:
+        return True
+    return str(rows[0]["value"]).lower() in ("true", "1", "active")
+
+
+def _set_system_state(active: bool) -> None:
+    _db_execute(
+        """
+        INSERT INTO system_config (key, value, updated_at)
+        VALUES ('system_active', $1, now())
+        ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = now()
+        """,
+        "true" if active else "false",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Live trading handlers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _handle_system_status(req: "BaseHTTPRequestHandler") -> None:
+    active = _is_system_active()
+    testnet = os.environ.get("BINANCE_TESTNET", "true").lower() != "false"
+    _json_response(req, 200, {
+        "system_active":  active,
+        "testnet":        testnet,
+        "network":        "TESTNET" if testnet else "MAINNET",
+        "api_key_set":    bool(os.environ.get("BINANCE_API_KEY")),
+        "secret_set":     bool(os.environ.get("BINANCE_API_SECRET")),
+        "live_trading":   os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true",
+    })
+
+
+def _handle_system_reset(req: "BaseHTTPRequestHandler") -> None:
+    """Re-activate system after a kill switch. Requires explicit POST."""
+    _set_system_state(True)
+    _json_response(req, 200, {
+        "status":  "ACTIVE",
+        "message": "System re-activated. Trading is unblocked.",
+    })
+
+
+def _handle_trade_execute(req: "BaseHTTPRequestHandler") -> None:
+    # ── Gate 1: system not halted ────────────────────────────────────────────
+    if not _is_system_active():
+        _json_response(req, 503, {
+            "detail": "System is HALTED by kill switch. Call POST /api/control/reset to re-activate.",
+        })
+        return
+
+    # ── Gate 2: live trading flag ────────────────────────────────────────────
+    if os.environ.get("ENABLE_LIVE_TRADING", "false").lower() != "true":
+        _json_response(req, 403, {
+            "detail": "Live trading is disabled. Set ENABLE_LIVE_TRADING=true in Vercel env vars.",
+        })
+        return
+
+    # ── Gate 3: parse and validate body ─────────────────────────────────────
+    body    = _read_body(req)
+    missing = [f for f in ("symbol", "side", "entry", "stop_loss", "take_profit") if not body.get(f)]
+    if missing:
+        _json_response(req, 400, {"detail": f"Missing required fields: {missing}"})
+        return
+
+    from decimal import Decimal, InvalidOperation  # noqa: PLC0415
+    try:
+        symbol      = str(body["symbol"]).strip().upper()
+        side        = str(body["side"]).strip().upper()
+        entry       = Decimal(str(body["entry"]))
+        stop_loss   = Decimal(str(body["stop_loss"]))
+        take_profit = Decimal(str(body["take_profit"]))
+    except (InvalidOperation, TypeError) as exc:
+        _json_response(req, 400, {"detail": f"Invalid numeric parameter: {exc}"})
+        return
+
+    if side not in ("BUY", "SELL"):
+        _json_response(req, 400, {"detail": "side must be 'BUY' or 'SELL'."})
+        return
+
+    # ── Gate 4: risk validation + order execution ────────────────────────────
+    try:
+        from btc_stm.exchange.binance_client import BinanceAuthError, BinanceOrderClient  # noqa: PLC0415
+        from btc_stm.exchange.trade_guard import TradeGuard, TradeSignal  # noqa: PLC0415
+
+        client = BinanceOrderClient.from_env()
+        guard  = TradeGuard(client)
+        signal = TradeSignal(
+            symbol=symbol, side=side,
+            entry=entry, stop_loss=stop_loss, take_profit=take_profit,
+        )
+
+        # Runs EMA-200 filter, 1% sizing, and ≥1:2 R:R check
+        order = guard.validate(signal)
+
+        # Place entry limit order
+        entry_result = client.place_limit_order(
+            symbol=order.symbol,
+            side=order.side,
+            quantity=order.quantity,
+            price=order.entry_price,
+        )
+
+        # Place OCO exit (TP limit + SL stop-limit, both cancelled when one fills)
+        exit_side = "SELL" if order.side == "BUY" else "BUY"
+        oco_result = client.place_oco_order(
+            symbol=order.symbol,
+            side=exit_side,
+            quantity=order.quantity,
+            take_profit_price=order.take_profit_price,
+            stop_loss_price=order.stop_loss_price,
+            stop_limit_price=order.stop_limit_price,
+        )
+
+        client.close()
+        _json_response(req, 200, {
+            "status":       "ok",
+            "entry_order":  entry_result,
+            "oco_order":    oco_result,
+            "risk_usdt":    round(order.risk_usdt, 4),
+            "rr_ratio":     round(order.rr_ratio, 2),
+            "quantity":     order.quantity,
+            "ema200":       round(order.ema200, 2),
+            "network":      "TESTNET" if os.environ.get("BINANCE_TESTNET", "true").lower() != "false" else "MAINNET",
+        })
+
+    except ValueError as exc:
+        # Risk policy breach — informative, not a server error
+        _json_response(req, 422, {"detail": str(exc), "blocked_by": "trade_guard"})
+    except BinanceAuthError as exc:
+        _json_response(req, 503, {"detail": str(exc)})
+    except Exception as exc:
+        _json_response(req, 500, {"detail": f"Trade execution failed: {exc}"})
+
+
+def _handle_kill_switch(req: "BaseHTTPRequestHandler") -> None:
+    """Emergency stop:
+    1. Cancel all open BTCUSDT orders.
+    2. Close any open BTC position at market.
+    3. Persist HALTED state in Neon DB.
+    """
+    results: dict = {}
+    symbol  = os.environ.get("KILL_SWITCH_SYMBOL", "BTCUSDT")
+
+    try:
+        from btc_stm.exchange.binance_client import BinanceAuthError, BinanceOrderClient  # noqa: PLC0415
+        from decimal import Decimal, ROUND_DOWN  # noqa: PLC0415
+
+        client = BinanceOrderClient.from_env()
+
+        # Step 1 — cancel all open orders
+        try:
+            cancelled             = client.cancel_all_orders(symbol)
+            results["cancelled"]  = len(cancelled) if isinstance(cancelled, list) else cancelled
+        except Exception as exc:
+            results["cancel_error"] = str(exc)
+
+        # Step 2 — close open BTC position at market
+        btc_total = client.get_total_balance("BTC")
+        if btc_total > 0.00001:
+            try:
+                qty_d = Decimal(str(btc_total))
+                qty   = client.round_qty(symbol, qty_d)
+                close = client.place_market_order(symbol, "SELL", str(qty))
+                results["position_closed"] = {
+                    "qty": str(qty),
+                    "order_id": close.get("orderId"),
+                    "status":   close.get("status"),
+                }
+            except Exception as exc:
+                results["close_error"] = str(exc)
+        else:
+            results["position_closed"] = "no_open_position"
+
+        client.close()
+
+    except Exception as exc:
+        # Credentials missing or network error — still persist HALTED state
+        results["exchange_error"] = str(exc)
+
+    # Step 3 — persist HALTED regardless of exchange errors above
+    _set_system_state(False)
+    results["system_active"] = False
+
+    _json_response(req, 200, {
+        "status":  "HALTED",
+        "message": "Kill switch activated. All orders cancelled, position closed, system frozen.",
+        "details": results,
+    })
+
+
 def _handle_secret_debug(req: "BaseHTTPRequestHandler") -> None:
     """Safe diagnostic — shows secret length and first/last char only."""
     raw = os.environ.get("MIGRATION_SECRET", "")
@@ -445,15 +660,26 @@ def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ROUTES: dict[tuple[str, str], object] = {
+    # Core
     ("GET",  "/api/health"):              _handle_health,
     ("GET",  "/api/secret-debug"):        _handle_secret_debug,
+    # Backtest
     ("GET",  "/api/backtest"):            _handle_backtest_get,
     ("POST", "/api/backtest"):            _handle_backtest_post,
+    # Paper trading
     ("GET",  "/api/paper-trade"):         _handle_paper_trade_get,
     ("POST", "/api/paper-trade"):         _handle_paper_trade_post,
+    # DB
     ("POST", "/api/migrate"):             _handle_migrate_post,
+    # Dashboard data
     ("GET",  "/api/portfolio/metrics"):   _handle_portfolio_metrics,
     ("GET",  "/api/logs"):                _handle_logs,
+    # Live trading
+    ("POST", "/api/trade/execute"):       _handle_trade_execute,
+    # System control
+    ("GET",  "/api/control/status"):      _handle_system_status,
+    ("POST", "/api/control/kill-switch"): _handle_kill_switch,
+    ("POST", "/api/control/reset"):       _handle_system_reset,
 }
 
 
