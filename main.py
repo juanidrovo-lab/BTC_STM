@@ -201,12 +201,22 @@ async def health():
 @app.post("/api/migrate")
 async def migrate(request: Request, token: str = ""):
     # Auth: ?token= query param (FastAPI native) or X-Migration-Secret header
-    provided   = (token or request.headers.get("X-Migration-Secret", "")).strip()
-    bypass     = os.environ.get("MIGRATION_BYPASS_TOKEN", "").strip()
-    secret     = os.environ.get("MIGRATION_SECRET", "").strip()
+    provided = (token or request.headers.get("X-Migration-Secret", "")).strip()
+    bypass   = os.environ.get("MIGRATION_BYPASS_TOKEN", "").strip()
+    secret   = os.environ.get("MIGRATION_SECRET", "").strip()
+
+    if not bypass and not secret:
+        raise HTTPException(status_code=503, detail="No migration secrets set in Railway env vars (MIGRATION_BYPASS_TOKEN / MIGRATION_SECRET).")
+
     authorized = (secret and provided == secret) or (bypass and provided == bypass)
     if not authorized:
-        raise HTTPException(status_code=403, detail="Invalid or missing migration token.")
+        raise HTTPException(status_code=403, detail={
+            "error":          "Invalid token.",
+            "bypass_set":     bool(bypass),
+            "secret_set":     bool(secret),
+            "provided_len":   len(provided),
+            "bypass_len":     len(bypass),
+        })
 
     db_url = os.environ.get("DATABASE_URL", "")
     if not db_url:
