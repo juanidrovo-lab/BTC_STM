@@ -699,23 +699,31 @@ async def test_order(symbol: str = "BTCUSDT", force_live: bool = False):
         "started_at": started_at,
     }
 
-    # ── Paso 1: precio real de Binance (prueba Railway → Fixie → Binance) ────
+    # ── Paso 1 + 2: klines → precio + indicadores (1 sola llamada a Fixie) ──────
+    # Usamos klines en lugar de ticker/price para evitar un round-trip extra
+    # y obtener EMA-200 + ATR-14 en la misma respuesta.
     try:
         client = await asyncio.to_thread(BinanceOrderClient.from_env)
     except BinanceAuthError as exc:
         raise HTTPException(status_code=503, detail=f"Credenciales Binance no configuradas: {exc}")
 
     try:
-        price = await asyncio.to_thread(client.get_ticker_price, sym)
-        result["binance_price"] = price
-        result["fixie_ok"]      = True
+        klines = await asyncio.to_thread(client.get_klines, sym, "1h", 210)
+        price  = float(klines[-1][4])          # último precio de cierre
+        result["binance_price"]  = price
+        result["klines_fetched"] = len(klines)
+        result["fixie_ok"]       = True
     except Exception as exc:
         await asyncio.to_thread(client.close)
-        raise HTTPException(status_code=502, detail=f"Error al conectar con Binance a través de Fixie: {exc}")
+        raise HTTPException(status_code=502, detail={
+            "message": "Error en la cadena Railway → Fixie → Binance",
+            "error":   str(exc),
+            "symbol":  sym,
+            "hint":    "Verifica HTTPS_PROXY en Railway y que el símbolo exista en testnet",
+        })
 
-    # ── Paso 2: klines para EMA-200 y ATR-14 ─────────────────────────────────
+    # ── Indicadores (CPU, sin red) ────────────────────────────────────────────
     try:
-        klines  = await asyncio.to_thread(client.get_klines, sym, "1h", 210)
         closes  = [float(k[4]) for k in klines]
         ema200  = _ema(closes[:-1], _EMA_PERIOD)
         atr14   = _compute_atr14(klines)
