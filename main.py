@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import sys
+import time as _time
 from contextlib import asynccontextmanager
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
 
 import asyncpg
@@ -72,66 +75,32 @@ async def db_execute(sql: str, *args: Any) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# App lifecycle
+# Strategy loop state  (in-memory — intentionally reset on each deployment)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _pool
-    db_url = os.environ.get("DATABASE_URL", "")
-    if db_url:
-        try:
-            _pool = await asyncpg.create_pool(_normalize_db_url(db_url), min_size=1, max_size=5)
-            log.info("DB pool ready")
-        except Exception as exc:
-            log.warning("DB pool failed to connect: %s", exc)
-    else:
-        log.warning("DATABASE_URL not set — DB endpoints will fail")
-    yield
-    if _pool:
-        await _pool.close()
-        log.info("DB pool closed")
+_loop_state: dict = {
+    "running":       False,
+    "ticks":         0,
+    "signals":       0,
+    "orders_placed": 0,
+    "last_tick_at":  None,   # ISO string UTC
+    "last_price":    None,
+    "last_ema200":   None,
+    "last_trend":    None,   # "BULL" | "BEAR" | "FLAT"
+    "last_gap_pct":  None,
+    "last_signal":   None,   # "BUY_CROSS" | "SELL_CROSS" | null
+    "last_error":    None,
+}
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# App + CORS
-# ─────────────────────────────────────────────────────────────────────────────
-
-app = FastAPI(
-    title="BTC-STM API",
-    version="0.2.0",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
-    lifespan=lifespan,
-)
-
-# CORS — allow Vercel frontend + local dev.
-# Set CORS_ORIGINS env var in Railway to override (comma-separated list).
-_default_origins = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "https://*.vercel.app",          # all Vercel preview/prod deployments
-]
-_env_origins = os.environ.get("CORS_ORIGINS", "")
-_allowed_origins = (
-    [o.strip() for o in _env_origins.split(",") if o.strip()]
-    if _env_origins
-    else _default_origins
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_origin_regex=r"https://.*\.vercel\.app",   # covers all *.vercel.app dynamically
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ATR multiplier for stop-loss and take-profit (gives exactly 1:2 R:R)
+_ATR_SL_MULT = Decimal("1.5")   # SL distance = 1.5 × ATR-14
+_ATR_TP_MULT = Decimal("3.0")   # TP distance = 3.0 × ATR-14  → R:R = 2.0
+_MAX_RISK    = Decimal("0.01")  # 1% of free USDT per trade
+_SL_SLIP     = Decimal("0.001") # 0.1% slippage buffer on the OCO stop-limit leg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# System state helpers (persisted in Neon system_config table)
+# Helpers shared by loop and endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def is_system_active() -> bool:
@@ -141,7 +110,7 @@ async def is_system_active() -> bool:
             return True
         return str(rows[0]["value"]).lower() in ("true", "1", "active")
     except Exception:
-        return True   # default active if table missing (pre-migration 002)
+        return True
 
 
 async def set_system_state(active: bool) -> None:
@@ -153,6 +122,333 @@ async def set_system_state(active: bool) -> None:
         """,
         "true" if active else "false",
     )
+
+
+async def _log_event(event_type: str, message: str, meta: dict | None = None) -> None:
+    """Write a system event to orchestrator_events (session_id = NULL for loop events)."""
+    try:
+        await db_execute(
+            """
+            INSERT INTO orchestrator_events (session_id, event_type, message, metadata)
+            VALUES (NULL, $1, $2, $3)
+            """,
+            event_type.upper(),
+            message[:1000],
+            json.dumps(meta or {}),
+        )
+    except Exception as exc:
+        log.warning("[log_event] failed: %s", exc)
+
+
+def _secs_to_next_candle() -> float:
+    """Seconds until 5 s after the next UTC 1h boundary.
+
+    Sleeping to the exact candle close ensures the REST klines response
+    contains the fully-closed bar before we evaluate the signal.
+    """
+    now        = _time.time()
+    next_hour  = (now // 3600 + 1) * 3600 + 5   # 5-second buffer after hour boundary
+    return max(next_hour - now, 1.0)
+
+
+def _compute_atr14(klines: list) -> float:
+    """ATR-14 from raw kline rows [openTime, o, h, l, c, ...]."""
+    trs = []
+    for i in range(1, len(klines)):
+        high       = float(klines[i][2])
+        low        = float(klines[i][3])
+        prev_close = float(klines[i - 1][4])
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(trs[-14:]) / 14
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Strategy loop core
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _strategy_tick() -> None:
+    """
+    One strategy evaluation cycle. Bandwidth budget per tick:
+
+      No signal  → 1 REST call  (~25 KB through Fixie)
+      Signal + paper → 1 REST call
+      Signal + live  → 5 REST calls  (klines + account + lot-info + limit + oco)
+
+    No WebSocket connections are opened at any point.
+    """
+    from btc_stm.exchange.binance_client import BinanceAuthError, BinanceOrderClient  # noqa: PLC0415
+    from btc_stm.exchange.trade_guard import _ema, _EMA_PERIOD  # noqa: PLC0415
+
+    symbol  = os.environ.get("STRATEGY_SYMBOL", "BTCUSDT")
+    live    = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    testnet = os.environ.get("BINANCE_TESTNET",    "true").lower()  != "false"
+
+    # ── 1. Check kill-switch (DB, no Binance call) ────────────────────────────
+    if not await is_system_active():
+        log.info("[loop] system HALTED — skipping tick")
+        return
+
+    # ── 2. Fetch klines  (ONE REST call through Fixie, ~25 KB) ───────────────
+    try:
+        client = await asyncio.to_thread(BinanceOrderClient.from_env)
+        klines = await asyncio.to_thread(client.get_klines, symbol, "1h", 210)
+        await asyncio.to_thread(client.close)
+    except BinanceAuthError:
+        # Credentials not yet configured — loop silently until they are.
+        return
+    except Exception as exc:
+        err = f"klines fetch failed: {exc}"
+        log.warning("[loop] %s", err)
+        _loop_state["last_error"] = err
+        return
+
+    # ── 3. Compute indicators (CPU-only, no network) ──────────────────────────
+    closes  = [float(k[4]) for k in klines]
+    current = closes[-1]           # last (possibly incomplete) bar's close
+    prev    = closes[-2]           # last fully-closed bar
+
+    # EMA-200: exclude the live in-progress bar
+    ema200  = _ema(closes[:-1], _EMA_PERIOD)
+    atr14   = _compute_atr14(klines)
+    gap_pct = (current - ema200) / ema200 * 100
+
+    trend = "BULL" if current > ema200 else ("BEAR" if current < ema200 else "FLAT")
+
+    # Crossover: previous close was on the opposite side of EMA-200
+    buy_cross  = prev <= ema200 < current
+    sell_cross = prev >= ema200 > current
+    signal     = "BUY_CROSS" if buy_cross else ("SELL_CROSS" if sell_cross else None)
+    side       = "BUY" if buy_cross else ("SELL" if sell_cross else None)
+
+    _loop_state.update({
+        "last_tick_at": datetime.now(timezone.utc).isoformat(),
+        "last_price":   round(current, 2),
+        "last_ema200":  round(ema200, 2),
+        "last_trend":   trend,
+        "last_gap_pct": round(gap_pct, 3),
+        "last_signal":  signal,
+        "last_error":   None,
+    })
+    _loop_state["ticks"] += 1
+
+    tick_msg = (f"[loop] tick {_loop_state['ticks']}: {symbol} @ ${current:.2f} | "
+                f"EMA200={ema200:.2f} | {trend} | gap={gap_pct:+.2f}% | "
+                f"ATR14={atr14:.2f} | signal={signal or 'none'}")
+    log.info(tick_msg)
+    await _log_event("INFO", tick_msg)
+
+    if signal is None:
+        return
+
+    _loop_state["signals"] += 1
+
+    # ── 4. Build order parameters (CPU-only) ──────────────────────────────────
+    entry_d  = Decimal(str(round(current, 2)))
+    atr_d    = Decimal(str(round(atr14, 8)))
+    sl_dist  = _ATR_SL_MULT * atr_d
+
+    if side == "BUY":
+        stop_loss   = entry_d - sl_dist
+        take_profit = entry_d + _ATR_TP_MULT * atr_d
+        stop_limit  = stop_loss * (Decimal("1") - _SL_SLIP)
+    else:
+        stop_loss   = entry_d + sl_dist
+        take_profit = entry_d - _ATR_TP_MULT * atr_d
+        stop_limit  = stop_loss * (Decimal("1") + _SL_SLIP)
+
+    sig_msg = (f"[loop] SIGNAL {signal}: {side} {symbol} @ {entry_d} | "
+               f"SL={stop_loss:.2f} TP={take_profit:.2f} ATR={atr14:.2f} "
+               f"network={'TESTNET' if testnet else 'MAINNET'} live={live}")
+    log.info(sig_msg)
+    await _log_event("INFO", sig_msg, {
+        "signal": signal, "entry": str(entry_d),
+        "stop_loss": str(stop_loss), "take_profit": str(take_profit),
+        "atr14": str(round(atr14, 2)), "ema200": str(round(ema200, 2)),
+    })
+
+    if not live:
+        return   # paper mode: logged above, nothing sent to exchange
+
+    # ── 5. Live execution (extra REST calls only when a signal fires) ─────────
+    await _execute_loop_trade(symbol, side, entry_d, stop_loss, take_profit, stop_limit)
+
+
+async def _execute_loop_trade(
+    symbol:      str,
+    side:        str,
+    entry:       Decimal,
+    stop_loss:   Decimal,
+    take_profit: Decimal,
+    stop_limit:  Decimal,
+) -> None:
+    """Place limit entry + OCO exit. 4 REST calls: account + lot-info + order + oco."""
+    from btc_stm.exchange.binance_client import BinanceOrderClient  # noqa: PLC0415
+
+    client = await asyncio.to_thread(BinanceOrderClient.from_env)
+    try:
+        # REST call 2: account balance
+        balance_f = await asyncio.to_thread(client.get_free_balance, "USDT")
+        balance   = Decimal(str(balance_f))
+        if balance < Decimal("10"):
+            msg = f"[loop] insufficient balance (${balance_f:.2f}) — order skipped"
+            log.warning(msg)
+            await _log_event("WARN", msg)
+            return
+
+        risk_usdt = balance * _MAX_RISK
+        sl_dist   = abs(entry - stop_loss)
+        raw_qty   = risk_usdt / sl_dist
+
+        # REST call 3: exchange info (lot-size filter)
+        qty = await asyncio.to_thread(client.round_qty, symbol, raw_qty)
+
+        # Format prices to 2 dp (BTCUSDT tick size)
+        def _p(d: Decimal) -> str:
+            return str(d.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+        # REST call 4: LIMIT entry
+        entry_res = await asyncio.to_thread(
+            client.place_limit_order, symbol, side, str(qty), _p(entry),
+        )
+
+        # REST call 5: OCO exit
+        exit_side = "SELL" if side == "BUY" else "BUY"
+        oco_res   = await asyncio.to_thread(
+            client.place_oco_order,
+            symbol, exit_side, str(qty),
+            _p(take_profit), _p(stop_loss), _p(stop_limit),
+        )
+
+        _loop_state["orders_placed"] += 1
+        ok_msg = (f"[loop] ORDER PLACED: {side} {qty} {symbol} @ {_p(entry)} | "
+                  f"SL={_p(stop_loss)} TP={_p(take_profit)} risk=${float(risk_usdt):.2f}")
+        log.info(ok_msg)
+        await _log_event("OK", ok_msg, {
+            "entry_order_id": entry_res.get("orderId"),
+            "oco_order_id":   oco_res.get("orderListId"),
+            "qty":            str(qty),
+            "risk_usdt":      float(risk_usdt),
+        })
+
+    except Exception as exc:
+        err_msg = f"[loop] order failed: {exc}"
+        log.error(err_msg)
+        _loop_state["last_error"] = str(exc)
+        await _log_event("ERROR", err_msg)
+    finally:
+        await asyncio.to_thread(client.close)
+
+
+async def _strategy_loop() -> None:
+    """
+    Background task: wakes up once per 1h candle close (UTC-synced),
+    runs one strategy tick, then sleeps until the next candle.
+
+    Uses only REST API calls — no WebSocket connections are ever opened.
+    Proxy bandwidth consumption: ≈ 25 KB/tick × 24 ticks/day ≈ 600 KB/day.
+    """
+    _loop_state["running"] = True
+    log.info("[loop] strategy loop started — waiting for first candle close")
+    await _log_event("INFO", "[loop] strategy loop started (REST-only, 1h interval)")
+
+    while True:
+        wait = _secs_to_next_candle()
+        log.info("[loop] sleeping %.0f s until next 1h candle close", wait)
+        await asyncio.sleep(wait)
+
+        try:
+            await _strategy_tick()
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            err = f"[loop] unhandled error in tick: {exc}"
+            log.exception(err)
+            _loop_state["last_error"] = str(exc)
+            try:
+                await _log_event("ERROR", err)
+            except Exception:
+                pass
+
+    _loop_state["running"] = False
+    log.info("[loop] strategy loop stopped")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# App lifecycle
+# ─────────────────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _pool
+
+    # Database pool
+    db_url = os.environ.get("DATABASE_URL", "")
+    if db_url:
+        try:
+            _pool = await asyncpg.create_pool(_normalize_db_url(db_url), min_size=1, max_size=5)
+            log.info("DB pool ready")
+        except Exception as exc:
+            log.warning("DB pool failed to connect: %s", exc)
+    else:
+        log.warning("DATABASE_URL not set — DB endpoints will fail")
+
+    # Strategy loop — only starts if at least BINANCE_API_KEY is configured.
+    # In paper mode ENABLE_LIVE_TRADING=false the loop still runs: it logs signals
+    # without placing real orders so you can verify the strategy before going live.
+    loop_task: asyncio.Task | None = None
+    if os.environ.get("BINANCE_API_KEY", "").strip():
+        loop_task = asyncio.create_task(_strategy_loop(), name="strategy_loop")
+        log.info("[loop] task created")
+    else:
+        log.info("[loop] BINANCE_API_KEY not set — strategy loop disabled")
+
+    yield
+
+    if loop_task and not loop_task.done():
+        loop_task.cancel()
+        try:
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+
+    if _pool:
+        await _pool.close()
+        log.info("DB pool closed")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# App + CORS
+# ─────────────────────────────────────────────────────────────────────────────
+
+app = FastAPI(
+    title="BTC-STM API",
+    version="0.3.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+    lifespan=lifespan,
+)
+
+_default_origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://*.vercel.app",
+]
+_env_origins = os.environ.get("CORS_ORIGINS", "")
+_allowed_origins = (
+    [o.strip() for o in _env_origins.split(",") if o.strip()]
+    if _env_origins
+    else _default_origins
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,7 +466,7 @@ class BacktestRequest(BaseModel):
 
 class TradeRequest(BaseModel):
     symbol:      str
-    side:        str         # "BUY" | "SELL"
+    side:        str
     entry:       str
     stop_loss:   str
     take_profit: str
@@ -188,14 +484,15 @@ async def health():
     return {
         "status":              "ok",
         "service":             "btc-stm",
-        "version":             "0.2.1",
-        "build":               "2026-05-18-C",
+        "version":             "0.3.0",
+        "build":               "2026-05-18-D",
         "python":              sys.version.split()[0],
         "trading_mode":        os.environ.get("TRADING_MODE", "paper"),
         "persistence_backend": os.environ.get("PERSISTENCE_BACKEND", "neon"),
         "db_configured":       bool(os.environ.get("DATABASE_URL")),
+        "api_key_set":         bool(os.environ.get("BINANCE_API_KEY", "").strip()),
+        "loop_running":        _loop_state["running"],
         "bypass_token_set":    bool(bypass),
-        "bypass_token_len":    len(bypass.strip()),
         "runtime":             "railway",
     }
 
@@ -204,22 +501,21 @@ async def health():
 
 @app.post("/api/migrate")
 async def migrate(request: Request, token: str = ""):
-    # Auth: ?token= query param (FastAPI native) or X-Migration-Secret header
     provided = (token or request.headers.get("X-Migration-Secret", "")).strip()
     bypass   = os.environ.get("MIGRATION_BYPASS_TOKEN", "").strip()
     secret   = os.environ.get("MIGRATION_SECRET", "").strip()
 
     if not bypass and not secret:
-        raise HTTPException(status_code=503, detail="No migration secrets set in Railway env vars (MIGRATION_BYPASS_TOKEN / MIGRATION_SECRET).")
+        raise HTTPException(status_code=503, detail="No migration secrets configured.")
 
     authorized = (secret and provided == secret) or (bypass and provided == bypass)
     if not authorized:
         raise HTTPException(status_code=403, detail={
-            "error":          "Invalid token.",
-            "bypass_set":     bool(bypass),
-            "secret_set":     bool(secret),
-            "provided_len":   len(provided),
-            "bypass_len":     len(bypass),
+            "error":        "Invalid token.",
+            "bypass_set":   bool(bypass),
+            "secret_set":   bool(secret),
+            "provided_len": len(provided),
+            "bypass_len":   len(bypass),
         })
 
     db_url = os.environ.get("DATABASE_URL", "")
@@ -235,15 +531,15 @@ async def migrate(request: Request, token: str = ""):
         if p.scheme in ("postgresql", "postgres"):
             p = p._replace(scheme="postgresql+asyncpg")
         orig = pqs(p.query)
-        qs2 = {k: v for k, v in orig.items() if k not in ("sslmode", "channel_binding")}
+        qs2  = {k: v for k, v in orig.items() if k not in ("sslmode", "channel_binding")}
         if "sslmode" in orig and "ssl" not in qs2:
             qs2["ssl"] = ["require"]
         norm = urlunparse(p._replace(query=urlencode({k: v[0] for k, v in qs2.items()})))
 
         os.environ["DATABASE_URL"] = norm
-        ini   = os.path.join(_ROOT, "db", "alembic.ini")
-        buf   = io.StringIO()
-        cfg   = Config(ini, stdout=buf)
+        ini = os.path.join(_ROOT, "db", "alembic.ini")
+        buf = io.StringIO()
+        cfg = Config(ini, stdout=buf)
         cfg.set_main_option("sqlalchemy.url", norm)
         alembic_cmd.upgrade(cfg, "head")
         return buf.getvalue()
@@ -253,6 +549,22 @@ async def migrate(request: Request, token: str = ""):
         return {"status": "ok", "output": output[-4000:] or "Migration completed (no output)."}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Migration error: {exc}")
+
+
+# ── Strategy loop status ──────────────────────────────────────────────────────
+
+@app.get("/api/strategy/status")
+async def strategy_status():
+    """Current state of the background strategy loop."""
+    secs_until_next = _secs_to_next_candle() if _loop_state["running"] else None
+    return {
+        **_loop_state,
+        "live_trading":    os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true",
+        "symbol":          os.environ.get("STRATEGY_SYMBOL", "BTCUSDT"),
+        "interval":        "1h",
+        "connection_type": "REST-only",   # no WebSocket in backend
+        "next_tick_secs":  round(secs_until_next, 0) if secs_until_next else None,
+    }
 
 
 # ── Portfolio metrics ─────────────────────────────────────────────────────────
@@ -275,11 +587,11 @@ async def portfolio_metrics():
             FROM trading_sessions ts
             LEFT JOIN execution_reports er ON er.session_id = ts.id
         """)
-        row           = agg[0] if agg else {}
-        total_trades  = int(row.get("total_trades")  or 0)
-        winning       = int(row.get("winning_trades") or 0)
-        initial       = float(row.get("initial_cash")   or 10000)
-        current       = float(row.get("current_equity") or initial)
+        row            = agg[0] if agg else {}
+        total_trades   = int(row.get("total_trades")  or 0)
+        winning        = int(row.get("winning_trades") or 0)
+        initial        = float(row.get("initial_cash")   or 10000)
+        current        = float(row.get("current_equity") or initial)
         total_sessions = int(row.get("total_sessions") or 0)
 
         win_rate     = (winning / total_trades * 100) if total_trades > 0 else 0.0
@@ -299,10 +611,10 @@ async def portfolio_metrics():
                 peak = max(peak, e)
                 if peak > 0:
                     max_drawdown = max(max_drawdown, (peak - e) / peak * 100)
-            returns = [(equities[i] - equities[i-1]) / equities[i-1]
-                       for i in range(1, len(equities)) if equities[i-1] != 0]
+            returns = [(equities[i] - equities[i - 1]) / equities[i - 1]
+                       for i in range(1, len(equities)) if equities[i - 1] != 0]
             if len(returns) > 1:
-                std = statistics.stdev(returns)
+                std    = statistics.stdev(returns)
                 sharpe = round((statistics.mean(returns) / std) * (252 ** 0.5), 2) if std > 0 else 0.0
 
         sign = "+" if total_return >= 0 else ""
@@ -337,10 +649,10 @@ async def logs():
         """)
         result = []
         for r in reversed(rows):
-            ts  = r["created_at"]
+            ts     = r["created_at"]
             ts_str = ts.strftime("%H:%M:%S") if hasattr(ts, "strftime") else str(ts)[11:19]
-            et  = str(r.get("event_type", "INFO")).upper()
-            lvl = "ERR" if et == "ERROR" else et if et in ("INFO", "OK", "WARN", "ERR") else "INFO"
+            et     = str(r.get("event_type", "INFO")).upper()
+            lvl    = "ERR" if et == "ERROR" else et if et in ("INFO", "OK", "WARN", "ERR") else "INFO"
             result.append({"ts": ts_str, "level": lvl, "msg": r["message"]})
         return {"logs": result, "count": len(result)}
     except Exception as exc:
@@ -352,8 +664,8 @@ async def logs():
 @app.get("/api/backtest")
 async def backtest_schema():
     return {
-        "endpoint":   "/api/backtest",
-        "method":     "POST",
+        "endpoint":    "/api/backtest",
+        "method":      "POST",
         "body_fields": ["symbol", "initial_cash", "fee_rate_bps", "slippage_bps", "execute_on", "bars"],
     }
 
@@ -446,6 +758,7 @@ async def system_status():
         "api_key_set":   bool(os.environ.get("BINANCE_API_KEY")),
         "secret_set":    bool(os.environ.get("BINANCE_API_SECRET")),
         "live_trading":  os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true",
+        "loop_running":  _loop_state["running"],
         "runtime":       "railway",
     }
 
@@ -463,18 +776,15 @@ async def kill_switch():
 
     async def _exchange_ops() -> None:
         from btc_stm.exchange.binance_client import BinanceOrderClient  # noqa: PLC0415
-        from decimal import Decimal  # noqa: PLC0415
 
         client = await asyncio.to_thread(BinanceOrderClient.from_env)
 
-        # 1. Cancel all open orders
         try:
             cancelled = await asyncio.to_thread(client.cancel_all_orders, symbol)
             results["cancelled"] = len(cancelled) if isinstance(cancelled, list) else cancelled
         except Exception as exc:
             results["cancel_error"] = str(exc)
 
-        # 2. Close open BTC position at market
         btc = await asyncio.to_thread(client.get_total_balance, "BTC")
         if btc > 0.00001:
             try:
@@ -493,7 +803,6 @@ async def kill_switch():
     except Exception as exc:
         results["exchange_error"] = str(exc)
 
-    # Persist HALTED state regardless of exchange errors
     await set_system_state(False)
     results["system_active"] = False
 
@@ -504,16 +813,14 @@ async def kill_switch():
     }
 
 
-# ── Live trade execution ──────────────────────────────────────────────────────
+# ── Manual trade execution ────────────────────────────────────────────────────
 
 @app.post("/api/trade/execute")
 async def trade_execute(payload: TradeRequest):
-    # Gate 1: system not halted
     if not await is_system_active():
         raise HTTPException(status_code=503,
             detail="System is HALTED. Call POST /api/control/reset to re-activate.")
 
-    # Gate 2: live trading flag
     if os.environ.get("ENABLE_LIVE_TRADING", "false").lower() != "true":
         raise HTTPException(status_code=403,
             detail="Live trading is disabled. Set ENABLE_LIVE_TRADING=true in Railway env vars.")
@@ -540,17 +847,14 @@ async def trade_execute(payload: TradeRequest):
             entry=entry, stop_loss=stop_loss, take_profit=take_profit,
         )
 
-        # TradeGuard: EMA-200 trend filter + 1% sizing + ≥1:2 R:R (all sync I/O)
         order = await asyncio.to_thread(guard.validate, signal)
 
-        # Place LIMIT entry
         entry_result = await asyncio.to_thread(
             client.place_limit_order,
             order.symbol, order.side, order.quantity, order.entry_price,
         )
 
-        # Place OCO exit (TP limit + SL stop-limit)
-        exit_side = "SELL" if order.side == "BUY" else "BUY"
+        exit_side  = "SELL" if order.side == "BUY" else "BUY"
         oco_result = await asyncio.to_thread(
             client.place_oco_order,
             order.symbol, exit_side, order.quantity,
