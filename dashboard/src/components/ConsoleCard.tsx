@@ -1,7 +1,7 @@
 'use client'
 
 import { GlassCard } from './GlassCard'
-import { Terminal, Circle } from 'lucide-react'
+import { Terminal } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 type LogLevel = 'INFO' | 'OK' | 'WARN' | 'ERR'
@@ -48,8 +48,8 @@ function now() {
 
 export function ConsoleCard() {
   const [logs, setLogs] = useState<LogLine[]>(INITIAL_LOGS)
-  const bottomRef = useRef<HTMLDivElement>(null)
-  let liveIdx = useRef(0)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const liveIdx = useRef(0)
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -61,7 +61,8 @@ export function ConsoleCard() {
   }, [])
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = bodyRef.current
+    if (el) el.scrollTop = el.scrollHeight
   }, [logs])
 
   return (
@@ -81,6 +82,7 @@ export function ConsoleCard() {
 
       {/* Terminal body */}
       <div
+        ref={bodyRef}
         className="flex-1 overflow-y-auto scrollbar-thin px-4 pb-4 font-mono text-[11px] leading-relaxed"
         style={{ background: 'rgba(2,6,15,0.7)' }}
       >
@@ -93,7 +95,6 @@ export function ConsoleCard() {
             <span className="text-slate-400 break-all">{line.msg}</span>
           </div>
         ))}
-        <div ref={bottomRef} />
       </div>
 
       {/* Prompt line */}
