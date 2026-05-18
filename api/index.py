@@ -283,9 +283,11 @@ def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
         from alembic import command as alembic_command  # noqa: PLC0415
         from alembic.config import Config  # noqa: PLC0415
 
-        # Capture alembic log output
-        log_stream = io.StringIO()
+        # env.py reads DATABASE_URL from os.environ — patch it with the
+        # normalized asyncpg URL so env.py doesn't override our value.
+        os.environ["DATABASE_URL"] = database_url
 
+        log_stream = io.StringIO()
         cfg = Config(alembic_ini, stdout=log_stream)
         cfg.set_main_option("sqlalchemy.url", database_url)
 
