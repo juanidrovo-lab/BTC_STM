@@ -664,6 +664,176 @@ async def toggle_live_trading():
     }
 
 
+# ── Test-order endpoint ───────────────────────────────────────────────────────
+
+@app.post("/api/trade/test-order")
+async def test_order(symbol: str = "BTCUSDT", force_live: bool = False):
+    """
+    Diagnostic endpoint: verifica la cadena Railway → Fixie → Binance → Neon DB.
+
+    Comportamiento:
+      - Siempre obtiene el precio real de Binance (1 llamada REST a través de Fixie).
+      - En modo PAPER: registra una orden simulada en orchestrator_events y devuelve
+        todos los parámetros calculados — sin tocar el exchange.
+      - En modo LIVE (solo si ENABLE_LIVE_TRADING=true Y force_live=true): coloca
+        una orden de mercado BUY por la cantidad mínima posible y la cierra
+        inmediatamente con SELL, usando el balance disponible.
+
+    Parámetros:
+      symbol     — par de trading (default: BTCUSDT)
+      force_live — si true Y live_trading activo, ejecuta orden real mínima
+    """
+    from btc_stm.exchange.binance_client import BinanceAuthError, BinanceOrderClient  # noqa: PLC0415
+    from btc_stm.exchange.trade_guard import _ema, _EMA_PERIOD                        # noqa: PLC0415
+
+    sym     = symbol.strip().upper()
+    live    = await get_live_trading_state()
+    testnet = os.environ.get("BINANCE_TESTNET", "true").lower() != "false"
+    do_live = live and force_live
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    result: dict = {
+        "symbol":   sym,
+        "testnet":  testnet,
+        "mode":     "LIVE" if do_live else "PAPER",
+        "started_at": started_at,
+    }
+
+    # ── Paso 1: precio real de Binance (prueba Railway → Fixie → Binance) ────
+    try:
+        client = await asyncio.to_thread(BinanceOrderClient.from_env)
+    except BinanceAuthError as exc:
+        raise HTTPException(status_code=503, detail=f"Credenciales Binance no configuradas: {exc}")
+
+    try:
+        price = await asyncio.to_thread(client.get_ticker_price, sym)
+        result["binance_price"] = price
+        result["fixie_ok"]      = True
+    except Exception as exc:
+        await asyncio.to_thread(client.close)
+        raise HTTPException(status_code=502, detail=f"Error al conectar con Binance a través de Fixie: {exc}")
+
+    # ── Paso 2: klines para EMA-200 y ATR-14 ─────────────────────────────────
+    try:
+        klines  = await asyncio.to_thread(client.get_klines, sym, "1h", 210)
+        closes  = [float(k[4]) for k in klines]
+        ema200  = _ema(closes[:-1], _EMA_PERIOD)
+        atr14   = _compute_atr14(klines)
+        trend   = "ALCISTA" if price > ema200 else "BAJISTA"
+        gap_pct = (price - ema200) / ema200 * 100
+
+        result.update({
+            "ema200":   round(ema200, 2),
+            "atr14":    round(atr14, 2),
+            "trend":    trend,
+            "gap_pct":  round(gap_pct, 2),
+        })
+    except Exception as exc:
+        result["indicators_error"] = str(exc)
+
+    # ── Paso 3: parámetros de la orden simulada ───────────────────────────────
+    entry_d     = Decimal(str(round(price, 2)))
+    sl_dist     = _ATR_SL_MULT * Decimal(str(round(atr14 if "atr14" in result else price * 0.01, 8)))
+    stop_loss   = entry_d - sl_dist
+    take_profit = entry_d + _ATR_TP_MULT * sl_dist
+    stop_limit  = stop_loss * (Decimal("1") - _SL_SLIP)
+
+    result.update({
+        "side":             "BUY",
+        "entry":            str(entry_d),
+        "stop_loss":        str(stop_loss.quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
+        "take_profit":      str(take_profit.quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
+        "risk_per_trade":   "1% del balance libre en USDT",
+        "rr_ratio":         "1:2",
+    })
+
+    # ── Paso 4a: PAPER — registrar en DB y devolver ───────────────────────────
+    if not do_live:
+        msg = (
+            f"[test] PAPER ORDER {sym} BUY @ {entry_d} | "
+            f"SL={stop_loss:.2f} TP={take_profit:.2f} | "
+            f"EMA200={ema200:.2f} {trend} | ATR14={atr14:.2f}"
+        )
+        await asyncio.to_thread(client.close)
+
+        # Prueba de escritura en Neon DB
+        try:
+            await _log_event("OK", msg, {
+                "test": True, "symbol": sym, "price": price,
+                "ema200": round(ema200, 2), "atr14": round(atr14, 2),
+            })
+            result["db_write"] = "OK — evento registrado en orchestrator_events"
+        except Exception as exc:
+            result["db_write"] = f"ERROR: {exc}"
+
+        result["order_placed"] = False
+        result["message"]      = (
+            "✓ Prueba completada en modo PAPER. "
+            "Verifica el ConsoleCard — deberías ver el evento 'OK [test] PAPER ORDER'. "
+            "Para probar una orden real usa ?force_live=true con ENABLE_LIVE_TRADING=true."
+        )
+        return result
+
+    # ── Paso 4b: LIVE — orden real mínima (BUY + SELL inmediato) ─────────────
+    try:
+        balance_f = await asyncio.to_thread(client.get_free_balance, "USDT")
+        if balance_f < 6.0:
+            raise ValueError(f"Balance insuficiente: ${balance_f:.2f} USDT (mínimo $6)")
+
+        # Cantidad mínima: lot step × ceil(minNotional / price / step)
+        lot   = await asyncio.to_thread(client.get_lot_size_filter, sym)
+        step  = Decimal(lot["stepSize"])
+        min_q = Decimal(lot["minQty"])
+        # Apuntar a $6 de valor nocional
+        target_qty = Decimal("6") / Decimal(str(price))
+        qty = max(
+            (target_qty / step).to_integral_value(ROUND_DOWN) * step,
+            min_q,
+        )
+        result["quantity"] = str(qty)
+        result["notional"] = f"~${float(qty) * price:.2f} USDT"
+
+        # BUY de mercado
+        buy_res = await asyncio.to_thread(
+            client.place_market_order, sym, "BUY", str(qty)
+        )
+        result["buy_order"] = {
+            "orderId": buy_res.get("orderId"),
+            "status":  buy_res.get("status"),
+        }
+
+        # SELL de mercado inmediato (cierra la posición)
+        sell_res = await asyncio.to_thread(
+            client.place_market_order, sym, "SELL", str(qty)
+        )
+        result["sell_order"] = {
+            "orderId": sell_res.get("orderId"),
+            "status":  sell_res.get("status"),
+        }
+
+        result["order_placed"] = True
+        ok_msg = (
+            f"[test] LIVE ROUNDTRIP {sym} qty={qty} notional={result['notional']} "
+            f"BUY={buy_res.get('orderId')} SELL={sell_res.get('orderId')} "
+            f"network={'TESTNET' if testnet else 'MAINNET'}"
+        )
+        await _log_event("OK", ok_msg, {"test": True, "live": True, "symbol": sym})
+        result["db_write"] = "OK"
+        result["message"]  = (
+            f"✓ Roundtrip real completado en {'TESTNET' if testnet else 'MAINNET'}. "
+            "Verifica el ConsoleCard y el historial de órdenes en Binance."
+        )
+
+    except Exception as exc:
+        result["order_placed"] = False
+        result["order_error"]  = str(exc)
+        await _log_event("ERROR", f"[test] LIVE ORDER FAILED {sym}: {exc}", {"test": True})
+    finally:
+        await asyncio.to_thread(client.close)
+
+    return result
+
+
 # ── Portfolio metrics ─────────────────────────────────────────────────────────
 
 @app.get("/api/portfolio/metrics")
