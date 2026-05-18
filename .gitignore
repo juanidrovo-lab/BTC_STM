@@ -9,3 +9,8 @@ __pycache__/
 src/*.egg-info/
 build/
 dist/
+
+# Next.js dashboard
+dashboard/.next/
+dashboard/node_modules/
+dashboard/next-env.d.ts
