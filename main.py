@@ -184,14 +184,18 @@ class TradeRequest(BaseModel):
 
 @app.get("/api/health")
 async def health():
+    bypass = os.environ.get("MIGRATION_BYPASS_TOKEN", "")
     return {
         "status":              "ok",
         "service":             "btc-stm",
-        "version":             "0.2.0",
+        "version":             "0.2.1",
+        "build":               "2026-05-18-C",
         "python":              sys.version.split()[0],
         "trading_mode":        os.environ.get("TRADING_MODE", "paper"),
         "persistence_backend": os.environ.get("PERSISTENCE_BACKEND", "neon"),
         "db_configured":       bool(os.environ.get("DATABASE_URL")),
+        "bypass_token_set":    bool(bypass),
+        "bypass_token_len":    len(bypass.strip()),
         "runtime":             "railway",
     }
 
