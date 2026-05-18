@@ -124,6 +124,28 @@ async def set_system_state(active: bool) -> None:
     )
 
 
+async def get_live_trading_state() -> bool:
+    """DB value overrides env var so the dashboard toggle works at runtime."""
+    try:
+        rows = await db_query("SELECT value FROM system_config WHERE key = 'live_trading' LIMIT 1")
+        if rows:
+            return str(rows[0]["value"]).lower() in ("true", "1")
+    except Exception:
+        pass
+    return os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+
+
+async def set_live_trading_state(enabled: bool) -> None:
+    await db_execute(
+        """
+        INSERT INTO system_config (key, value, updated_at)
+        VALUES ('live_trading', $1, now())
+        ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = now()
+        """,
+        "true" if enabled else "false",
+    )
+
+
 async def _log_event(event_type: str, message: str, meta: dict | None = None) -> None:
     """Write a system event to orchestrator_events (session_id = NULL for loop events)."""
     try:
@@ -180,7 +202,7 @@ async def _strategy_tick() -> None:
     from btc_stm.exchange.trade_guard import _ema, _EMA_PERIOD  # noqa: PLC0415
 
     symbol  = os.environ.get("STRATEGY_SYMBOL", "BTCUSDT")
-    live    = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    live    = await get_live_trading_state()
     testnet = os.environ.get("BINANCE_TESTNET",    "true").lower()  != "false"
 
     # ── 1. Check kill-switch (DB, no Binance call) ────────────────────────────
@@ -557,13 +579,35 @@ async def migrate(request: Request, token: str = ""):
 async def strategy_status():
     """Current state of the background strategy loop."""
     secs_until_next = _secs_to_next_candle() if _loop_state["running"] else None
+    live = await get_live_trading_state()
     return {
         **_loop_state,
-        "live_trading":    os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true",
+        "live_trading":    live,
         "symbol":          os.environ.get("STRATEGY_SYMBOL", "BTCUSDT"),
         "interval":        "1h",
-        "connection_type": "REST-only",   # no WebSocket in backend
+        "connection_type": "REST-only",
         "next_tick_secs":  round(secs_until_next, 0) if secs_until_next else None,
+    }
+
+
+@app.post("/api/strategy/toggle-live")
+async def toggle_live_trading():
+    """Toggle live/paper trading. State is persisted in system_config (overrides env var)."""
+    current   = await get_live_trading_state()
+    new_state = not current
+    await set_live_trading_state(new_state)
+    mode = "LIVE" if new_state else "PAPER"
+    msg  = f"[control] live trading switched to {mode}"
+    log.info(msg)
+    await _log_event("INFO", msg)
+    return {
+        "live_trading": new_state,
+        "mode":         mode,
+        "message":      (
+            "Live trading ENABLED — real orders will be placed on Binance"
+            if new_state else
+            "Live trading DISABLED — paper mode active, no real orders"
+        ),
     }
 
 

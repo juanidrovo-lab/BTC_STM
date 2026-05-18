@@ -1,18 +1,26 @@
 'use client'
 
-import { Activity, Zap } from 'lucide-react'
+import { Activity, Lock, Zap } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { LiveToggle } from './LiveToggle'
 
 interface TickerData {
-  price: string
-  change: string
+  price:    string
+  change:   string
   positive: boolean
 }
 
+const NAV_ITEMS = [
+  { label: 'Dashboard', active: true  },
+  { label: 'Trading',   active: false },
+  { label: 'Analytics', active: false },
+  { label: 'Settings',  active: false },
+]
+
 export function Header() {
-  const [time, setTime]     = useState('')
+  const [time,   setTime]   = useState('')
   const [ticker, setTicker] = useState<TickerData>({ price: '—', change: '—', positive: true })
-  const wsRef               = useRef<WebSocket | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
 
   // Clock
   useEffect(() => {
@@ -22,15 +30,14 @@ export function Header() {
     return () => clearInterval(id)
   }, [])
 
-  // BTC real price — Binance public miniTicker WebSocket (no API key needed)
+  // BTC price — Binance public miniTicker WebSocket (browser-direct, no proxy)
   useEffect(() => {
     function connect() {
       const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@miniTicker')
       wsRef.current = ws
-
       ws.onmessage = (e) => {
         try {
-          const d = JSON.parse(e.data)
+          const d        = JSON.parse(e.data)
           const price    = parseFloat(d.c)
           const open     = parseFloat(d.o)
           const pct      = ((price - open) / open) * 100
@@ -42,25 +49,18 @@ export function Header() {
           })
         } catch {}
       }
-
-      ws.onclose = () => {
-        // reconnect after 3s if closed unexpectedly
-        setTimeout(connect, 3000)
-      }
+      ws.onclose = () => setTimeout(connect, 3000)
     }
-
     connect()
-    return () => {
-      wsRef.current?.close()
-      wsRef.current = null
-    }
+    return () => { wsRef.current?.close(); wsRef.current = null }
   }, [])
 
   return (
     <header className="sticky top-0 z-50 border-b border-white/[0.06] bg-[#070a13]/80 backdrop-blur-xl">
       <div className="mx-auto max-w-[1600px] px-4 sm:px-6 lg:px-8">
         <div className="flex h-16 items-center justify-between gap-4">
-          {/* Logo */}
+
+          {/* ── Logo ── */}
           <div className="flex items-center gap-3 flex-shrink-0">
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-cyan-500/10 ring-1 ring-cyan-500/20">
               <Activity className="h-5 w-5 text-cyan-400" />
@@ -71,25 +71,34 @@ export function Header() {
             </div>
           </div>
 
-          {/* Nav */}
+          {/* ── Nav ── */}
           <nav className="hidden md:flex items-center gap-1">
-            {['Dashboard', 'Trading', 'Analytics', 'Settings'].map((item, i) => (
-              <button
-                key={item}
-                className={`px-4 py-1.5 rounded-lg text-xs font-medium uppercase tracking-wider transition-all duration-200 ${
-                  i === 0
-                    ? 'bg-cyan-500/10 text-cyan-400 ring-1 ring-cyan-500/20'
-                    : 'text-slate-500 hover:text-slate-300 hover:bg-white/[0.04]'
-                }`}
-              >
-                {item}
-              </button>
-            ))}
+            {NAV_ITEMS.map(({ label, active }) =>
+              active ? (
+                <button
+                  key={label}
+                  className="px-4 py-1.5 rounded-lg text-xs font-medium uppercase tracking-wider bg-cyan-500/10 text-cyan-400 ring-1 ring-cyan-500/20"
+                >
+                  {label}
+                </button>
+              ) : (
+                <button
+                  key={label}
+                  disabled
+                  title="Próximamente"
+                  className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-xs font-medium uppercase tracking-wider text-slate-600 cursor-not-allowed opacity-50"
+                >
+                  <Lock className="h-2.5 w-2.5" />
+                  {label}
+                </button>
+              )
+            )}
           </nav>
 
-          {/* Right side */}
-          <div className="flex items-center gap-4 flex-shrink-0">
-            {/* BTC Price */}
+          {/* ── Right side ── */}
+          <div className="flex items-center gap-3 flex-shrink-0">
+
+            {/* BTC price */}
             <div className="hidden sm:flex items-center gap-2 rounded-lg bg-white/[0.03] border border-white/[0.06] px-3 py-1.5">
               <Zap className="h-3.5 w-3.5 text-amber-400" />
               <span className="text-xs font-mono font-medium text-slate-300">
@@ -100,13 +109,18 @@ export function Header() {
               </span>
             </div>
 
+            {/* Live / Paper toggle */}
+            <LiveToggle />
+
             {/* Connected indicator */}
             <div className="flex items-center gap-2 rounded-lg bg-emerald-500/[0.06] border border-emerald-500/[0.12] px-3 py-1.5">
               <span className="relative flex h-2 w-2">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60" />
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400" />
               </span>
-              <span className="text-xs font-medium text-emerald-400 tracking-wide">Connected</span>
+              <span className="text-xs font-medium text-emerald-400 tracking-wide">
+                Connected
+              </span>
             </div>
 
             {/* Clock */}
@@ -114,6 +128,7 @@ export function Header() {
               {time}
             </span>
           </div>
+
         </div>
       </div>
     </header>
