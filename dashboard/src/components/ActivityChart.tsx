@@ -130,7 +130,7 @@ export function ActivityChart({ symbol = 'BTCUSDT' }: Props) {
       })
       chart.priceScale('vol').applyOptions({
         scaleMargins:  { top: 0.78, bottom: 0 },
-        drawTicks:     false,
+        ticksVisible:  false,
         borderVisible: false,
       })
 
