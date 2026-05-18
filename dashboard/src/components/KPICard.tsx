@@ -1,42 +1,27 @@
-import { GlassCard } from './GlassCard'
-import { TrendingUp, TrendingDown, Minus, ArrowUpRight, ArrowDownRight } from 'lucide-react'
+'use client'
 
-const kpis = [
-  {
-    label:     'Total Return',
-    value:     '+12.47%',
-    subtext:   'Since inception',
-    direction: 'up' as const,
-    color:     'emerald',
-  },
-  {
-    label:     'Max Drawdown',
-    value:     '-2.84%',
-    subtext:   'Peak to trough',
-    direction: 'down' as const,
-    color:     'red',
-  },
-  {
-    label:     'Win Rate',
-    value:     '67.3%',
-    subtext:   '142 total trades',
-    direction: 'up' as const,
-    color:     'cyan',
-  },
-  {
-    label:     'Sharpe Ratio',
-    value:     '1.84',
-    subtext:   'Risk-adjusted',
-    direction: 'neutral' as const,
-    color:     'slate',
-  },
-]
+import { GlassCard } from './GlassCard'
+import { ArrowUpRight, ArrowDownRight, Minus, RefreshCw } from 'lucide-react'
+import { useEffect, useState, useCallback } from 'react'
+
+interface PortfolioMetrics {
+  total_return_str: string
+  total_return:     number
+  max_drawdown_str: string
+  win_rate_str:     string
+  win_rate:         number
+  sharpe_str:       string
+  sharpe:           number
+  total_trades:     number
+  current_equity:   number
+  source:           string
+}
 
 const colorMap = {
   emerald: { value: 'text-emerald-400', badge: 'bg-emerald-500/10 text-emerald-400 ring-emerald-500/20' },
-  red:     { value: 'text-red-400',     badge: 'bg-red-500/10    text-red-400    ring-red-500/20'     },
-  cyan:    { value: 'text-cyan-400',    badge: 'bg-cyan-500/10   text-cyan-400   ring-cyan-500/20'    },
-  slate:   { value: 'text-slate-300',   badge: 'bg-slate-500/10  text-slate-400  ring-slate-500/20'   },
+  red:     { value: 'text-red-400',     badge: 'bg-red-500/10    text-red-400    ring-red-500/20'       },
+  cyan:    { value: 'text-cyan-400',    badge: 'bg-cyan-500/10   text-cyan-400   ring-cyan-500/20'      },
+  slate:   { value: 'text-slate-300',   badge: 'bg-slate-500/10  text-slate-400  ring-slate-500/20'     },
 }
 
 const iconMap = {
@@ -45,13 +30,87 @@ const iconMap = {
   neutral: <Minus          className="h-3 w-3" />,
 }
 
+function kpiList(m: PortfolioMetrics) {
+  return [
+    {
+      label:     'Total Return',
+      value:     m.total_return_str,
+      subtext:   `Equity $${m.current_equity.toLocaleString()}`,
+      direction: (m.total_return >= 0 ? 'up' : 'down') as 'up' | 'down',
+      color:     m.total_return >= 0 ? 'emerald' : 'red',
+    },
+    {
+      label:     'Max Drawdown',
+      value:     m.max_drawdown_str,
+      subtext:   'Peak to trough',
+      direction: 'down' as const,
+      color:     'red',
+    },
+    {
+      label:     'Win Rate',
+      value:     m.win_rate_str,
+      subtext:   `${m.total_trades} total trades`,
+      direction: (m.win_rate >= 50 ? 'up' : 'down') as 'up' | 'down',
+      color:     'cyan',
+    },
+    {
+      label:     'Sharpe Ratio',
+      value:     m.sharpe_str,
+      subtext:   'Risk-adjusted',
+      direction: 'neutral' as const,
+      color:     'slate',
+    },
+  ]
+}
+
+const EMPTY_METRICS: PortfolioMetrics = {
+  total_return_str: '+0.00%', total_return: 0,
+  max_drawdown_str: '-0.00%',
+  win_rate_str: '0.0%',       win_rate: 0,
+  sharpe_str: '0.00',         sharpe: 0,
+  total_trades: 0,
+  current_equity: 10000,
+  source: 'empty',
+}
+
 export function KPICard() {
+  const [metrics, setMetrics] = useState<PortfolioMetrics | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError]     = useState(false)
+
+  const fetch_ = useCallback(async () => {
+    try {
+      const res = await fetch('/api/portfolio/metrics')
+      if (!res.ok) throw new Error()
+      const data: PortfolioMetrics = await res.json()
+      setMetrics(data)
+      setError(false)
+    } catch {
+      setError(true)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    fetch_()
+    const id = setInterval(fetch_, 30_000)
+    return () => clearInterval(id)
+  }, [fetch_])
+
+  const display = metrics ?? EMPTY_METRICS
+  const kpis    = kpiList(display)
+  const isEmpty = display.source === 'empty'
+
   return (
     <GlassCard glow="cyan" padding={false} className="flex flex-col">
       {/* Header */}
-      <div className="p-6 pb-4">
-        <p className="label-xs mb-1.5">Performance KPIs</p>
-        <h2 className="text-lg font-medium text-slate-100">Portfolio Metrics</h2>
+      <div className="p-6 pb-4 flex items-start justify-between">
+        <div>
+          <p className="label-xs mb-1.5">Performance KPIs</p>
+          <h2 className="text-lg font-medium text-slate-100">Portfolio Metrics</h2>
+        </div>
+        {loading && <RefreshCw className="h-4 w-4 text-slate-600 animate-spin mt-1" />}
       </div>
 
       <div className="mx-6 h-px bg-gradient-to-r from-transparent via-white/[0.06] to-transparent" />
@@ -72,8 +131,12 @@ export function KPICard() {
                   {iconMap[direction]}
                 </span>
               </div>
-              <p className={`text-2xl font-light tracking-tight ${c.value}`}>{value}</p>
-              <p className="mt-1 text-[10px] text-slate-600">{subtext}</p>
+              <p className={`text-2xl font-light tracking-tight ${isEmpty ? 'text-slate-600' : c.value}`}>
+                {value}
+              </p>
+              <p className="mt-1 text-[10px] text-slate-600">
+                {error ? 'API error' : isEmpty ? 'No sessions yet' : subtext}
+              </p>
             </div>
           )
         })}

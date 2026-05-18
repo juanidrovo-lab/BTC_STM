@@ -215,6 +215,144 @@ def _handle_paper_trade_post(req: "BaseHTTPRequestHandler") -> None:
         _json_response(req, 500, {"detail": str(exc)})
 
 
+def _normalize_db_url_asyncpg(database_url: str) -> str:
+    """Return a URL suitable for asyncpg.connect() — no dialect suffix, ssl=require."""
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse  # noqa: PLC0415
+    p = urlparse(database_url)
+    scheme = "postgresql" if p.scheme in ("postgresql", "postgres", "postgresql+asyncpg") else p.scheme
+    orig_qs = parse_qs(p.query)
+    qs = {k: v for k, v in orig_qs.items() if k not in ("sslmode", "channel_binding")}
+    if "sslmode" in orig_qs and "ssl" not in qs:
+        qs["ssl"] = ["require"]
+    return urlunparse(p._replace(scheme=scheme, query=urlencode({k: v[0] for k, v in qs.items()})))
+
+
+def _db_query(sql: str, *args: object) -> list[dict]:
+    """Run a read-only query against Neon DB; returns [] on any error."""
+    import asyncio  # noqa: PLC0415
+    import asyncpg  # noqa: PLC0415
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        return []
+    dsn = _normalize_db_url_asyncpg(database_url)
+
+    async def _run() -> list[dict]:
+        conn = await asyncpg.connect(dsn)
+        try:
+            rows = await conn.fetch(sql, *args)
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
+    try:
+        return asyncio.run(_run())
+    except Exception:
+        return []
+
+
+def _handle_portfolio_metrics(req: "BaseHTTPRequestHandler") -> None:
+    if not os.environ.get("DATABASE_URL"):
+        _json_response(req, 503, {"detail": "DATABASE_URL not configured."})
+        return
+    try:
+        agg = _db_query("""
+            SELECT
+                COUNT(er.id)::int                                                            AS total_trades,
+                COALESCE(SUM(CASE WHEN er.realized_pnl > 0 THEN 1 ELSE 0 END), 0)::int     AS winning_trades,
+                COALESCE(SUM(er.realized_pnl::float), 0)                                    AS total_pnl,
+                COALESCE(MAX(ts.initial_cash::float),  10000)                               AS initial_cash,
+                COALESCE(
+                    (SELECT current_equity::float FROM trading_sessions
+                     WHERE current_equity IS NOT NULL ORDER BY started_at DESC LIMIT 1),
+                    10000
+                )                                                                            AS current_equity,
+                COUNT(DISTINCT ts.id)::int                                                   AS total_sessions
+            FROM trading_sessions ts
+            LEFT JOIN execution_reports er ON er.session_id = ts.id
+        """)
+        row           = agg[0] if agg else {}
+        total_trades  = int(row.get("total_trades")  or 0)
+        winning       = int(row.get("winning_trades") or 0)
+        initial       = float(row.get("initial_cash")    or 10000)
+        current       = float(row.get("current_equity")  or initial)
+        total_sessions = int(row.get("total_sessions") or 0)
+
+        win_rate     = (winning / total_trades * 100) if total_trades > 0 else 0.0
+        total_return = ((current - initial) / initial * 100) if initial > 0 else 0.0
+
+        # Drawdown + Sharpe from equity curve of most recent session
+        eq_rows = _db_query("""
+            SELECT equity::float, recorded_at
+            FROM equity_curve
+            WHERE session_id = (SELECT id FROM trading_sessions ORDER BY started_at DESC LIMIT 1)
+            ORDER BY recorded_at ASC
+            LIMIT 500
+        """)
+        max_drawdown = 0.0
+        sharpe       = 0.0
+        if len(eq_rows) > 1:
+            import statistics  # noqa: PLC0415
+            equities = [r["equity"] for r in eq_rows]
+            peak = equities[0]
+            for e in equities:
+                if e > peak:
+                    peak = e
+                if peak > 0:
+                    dd = (peak - e) / peak * 100
+                    if dd > max_drawdown:
+                        max_drawdown = dd
+            returns = [(equities[i] - equities[i - 1]) / equities[i - 1]
+                       for i in range(1, len(equities)) if equities[i - 1] != 0]
+            if len(returns) > 1:
+                mean_r = statistics.mean(returns)
+                std_r  = statistics.stdev(returns)
+                sharpe = round((mean_r / std_r) * (252 ** 0.5), 2) if std_r > 0 else 0.0
+
+        sign = "+" if total_return >= 0 else ""
+        _json_response(req, 200, {
+            "total_return":     round(total_return, 2),
+            "total_return_str": f"{sign}{total_return:.2f}%",
+            "max_drawdown":     round(-abs(max_drawdown), 2),
+            "max_drawdown_str": f"-{max_drawdown:.2f}%",
+            "win_rate":         round(win_rate, 1),
+            "win_rate_str":     f"{win_rate:.1f}%",
+            "sharpe":           sharpe,
+            "sharpe_str":       str(sharpe),
+            "total_trades":     total_trades,
+            "current_equity":   round(current, 2),
+            "initial_cash":     round(initial, 2),
+            "total_sessions":   total_sessions,
+            "source":           "neon" if total_sessions > 0 else "empty",
+        })
+    except Exception as exc:
+        _json_response(req, 500, {"detail": str(exc)})
+
+
+def _handle_logs(req: "BaseHTTPRequestHandler") -> None:
+    if not os.environ.get("DATABASE_URL"):
+        _json_response(req, 503, {"detail": "DATABASE_URL not configured."})
+        return
+    try:
+        rows = _db_query("""
+            SELECT event_type, message, created_at
+            FROM orchestrator_events
+            ORDER BY created_at DESC
+            LIMIT 60
+        """)
+        logs = []
+        for r in reversed(rows):
+            ts  = r["created_at"]
+            ts_str = ts.strftime("%H:%M:%S") if hasattr(ts, "strftime") else str(ts)[11:19]
+            et = str(r.get("event_type", "INFO")).upper()
+            level = et if et in ("INFO", "OK", "WARN", "ERR", "ERROR") else "INFO"
+            if level == "ERROR":
+                level = "ERR"
+            logs.append({"ts": ts_str, "level": level, "msg": r["message"]})
+        _json_response(req, 200, {"logs": logs, "count": len(logs)})
+    except Exception as exc:
+        _json_response(req, 500, {"detail": str(exc)})
+
+
 def _handle_secret_debug(req: "BaseHTTPRequestHandler") -> None:
     """Safe diagnostic — shows secret length and first/last char only."""
     raw = os.environ.get("MIGRATION_SECRET", "")
@@ -307,13 +445,15 @@ def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ROUTES: dict[tuple[str, str], object] = {
-    ("GET",  "/api/health"):        _handle_health,
-    ("GET",  "/api/secret-debug"):  _handle_secret_debug,
-    ("GET",  "/api/backtest"):      _handle_backtest_get,
-    ("POST", "/api/backtest"):      _handle_backtest_post,
-    ("GET",  "/api/paper-trade"):   _handle_paper_trade_get,
-    ("POST", "/api/paper-trade"):   _handle_paper_trade_post,
-    ("POST", "/api/migrate"):       _handle_migrate_post,
+    ("GET",  "/api/health"):              _handle_health,
+    ("GET",  "/api/secret-debug"):        _handle_secret_debug,
+    ("GET",  "/api/backtest"):            _handle_backtest_get,
+    ("POST", "/api/backtest"):            _handle_backtest_post,
+    ("GET",  "/api/paper-trade"):         _handle_paper_trade_get,
+    ("POST", "/api/paper-trade"):         _handle_paper_trade_post,
+    ("POST", "/api/migrate"):             _handle_migrate_post,
+    ("GET",  "/api/portfolio/metrics"):   _handle_portfolio_metrics,
+    ("GET",  "/api/logs"):                _handle_logs,
 }
 
 
