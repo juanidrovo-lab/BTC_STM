@@ -264,6 +264,19 @@ def _handle_migrate_post(req: "BaseHTTPRequestHandler") -> None:
         _json_response(req, 503, {"detail": "DATABASE_URL not configured."})
         return
 
+    # Normalize URL for asyncpg driver used by our async Alembic env.py
+    # Vercel env var may be set to plain postgresql:// (psycopg2 default)
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse  # noqa: PLC0415
+    _p = urlparse(database_url)
+    if _p.scheme in ("postgresql", "postgres"):
+        _p = _p._replace(scheme="postgresql+asyncpg")
+    # asyncpg uses ?ssl= not ?sslmode=; strip channel_binding
+    _qs = {k: v for k, v in parse_qs(_p.query).items()
+           if k not in ("sslmode", "channel_binding")}
+    if "sslmode" in parse_qs(_p.query) and "ssl" not in _qs:
+        _qs["ssl"] = ["require"]
+    database_url = urlunparse(_p._replace(query=urlencode({k: v[0] for k, v in _qs.items()})))
+
     alembic_ini = os.path.join(_ROOT, "db", "alembic.ini")
     try:
         import io  # noqa: PLC0415
