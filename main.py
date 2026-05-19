@@ -669,19 +669,15 @@ async def toggle_live_trading():
 @app.post("/api/trade/test-order")
 async def test_order(symbol: str = "BTCUSDT", force_live: bool = False):
     """
-    Diagnostic endpoint: verifica la cadena Railway → Fixie → Binance → Neon DB.
+    Diagnóstico end-to-end: Railway → Fixie → Binance → Neon DB.
 
-    Comportamiento:
-      - Siempre obtiene el precio real de Binance (1 llamada REST a través de Fixie).
-      - En modo PAPER: registra una orden simulada en orchestrator_events y devuelve
-        todos los parámetros calculados — sin tocar el exchange.
-      - En modo LIVE (solo si ENABLE_LIVE_TRADING=true Y force_live=true): coloca
-        una orden de mercado BUY por la cantidad mínima posible y la cierra
-        inmediatamente con SELL, usando el balance disponible.
-
-    Parámetros:
-      symbol     — par de trading (default: BTCUSDT)
-      force_live — si true Y live_trading activo, ejecuta orden real mínima
+    Paso 1 — conectividad: obtiene klines del endpoint PÚBLICO de mainnet
+              (no requiere API key, no requiere whitelist de IP).
+              Esto verifica que Railway llega a Binance a través de Fixie.
+    Paso 2 — indicadores: calcula EMA-200 y ATR-14 en CPU.
+    Paso 3 — DB: escribe un evento en orchestrator_events (visible en el ConsoleCard).
+    Paso 4 — live (opcional): con force_live=true Y ENABLE_LIVE_TRADING=true,
+              ejecuta un roundtrip mínimo BUY+SELL en el exchange configurado.
     """
     from btc_stm.exchange.binance_client import BinanceAuthError, BinanceOrderClient  # noqa: PLC0415
     from btc_stm.exchange.trade_guard import _ema, _EMA_PERIOD                        # noqa: PLC0415
@@ -691,74 +687,94 @@ async def test_order(symbol: str = "BTCUSDT", force_live: bool = False):
     testnet = os.environ.get("BINANCE_TESTNET", "true").lower() != "false"
     do_live = live and force_live
 
-    started_at = datetime.now(timezone.utc).isoformat()
     result: dict = {
-        "symbol":   sym,
-        "testnet":  testnet,
-        "mode":     "LIVE" if do_live else "PAPER",
-        "started_at": started_at,
+        "symbol":     sym,
+        "testnet":    testnet,
+        "mode":       "LIVE" if do_live else "PAPER",
+        "started_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ── Paso 1 + 2: klines → precio + indicadores (1 sola llamada a Fixie) ──────
-    # Usamos klines en lugar de ticker/price para evitar un round-trip extra
-    # y obtener EMA-200 + ATR-14 en la misma respuesta.
-    try:
-        client = await asyncio.to_thread(BinanceOrderClient.from_env)
-    except BinanceAuthError as exc:
-        raise HTTPException(status_code=503, detail=f"Credenciales Binance no configuradas: {exc}")
+    # ── Paso 1: klines desde mainnet público (no necesita auth ni IP whitelist) ─
+    # Siempre usamos mainnet para este paso; testnet es inestable y el endpoint
+    # de klines es público. El proxy Fixie DEBE estar en la ruta para que funcione.
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    result["proxy_configured"] = bool(proxy)
 
     try:
-        klines = await asyncio.to_thread(client.get_klines, sym, "1h", 210)
-        price  = float(klines[-1][4])          # último precio de cierre
-        result["binance_price"]  = price
-        result["klines_fetched"] = len(klines)
-        result["fixie_ok"]       = True
+        import httpx as _httpx  # noqa: PLC0415
+        proxy_kwargs = {"proxy": proxy} if proxy else {}
+        async with _httpx.AsyncClient(timeout=10.0, **proxy_kwargs) as http:
+            resp = await http.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": sym, "interval": "1h", "limit": 210},
+            )
+        resp.raise_for_status()
+        klines = resp.json()
+        if not isinstance(klines, list) or len(klines) < 10:
+            raise ValueError(f"Respuesta inesperada de Binance: {str(klines)[:120]}")
+
+        price = float(klines[-1][4])
+        result.update({
+            "binance_price":  price,
+            "klines_fetched": len(klines),
+            "fixie_ok":       True,
+            "proxy_used":     proxy or "sin proxy (directo)",
+        })
     except Exception as exc:
-        await asyncio.to_thread(client.close)
+        result["fixie_ok"] = False
         raise HTTPException(status_code=502, detail={
-            "message": "Error en la cadena Railway → Fixie → Binance",
-            "error":   str(exc),
-            "symbol":  sym,
-            "hint":    "Verifica HTTPS_PROXY en Railway y que el símbolo exista en testnet",
+            "message":          "No se pudo obtener klines de Binance",
+            "error":            f"{type(exc).__name__}: {exc}",
+            "proxy_configured": bool(proxy),
+            "proxy_url":        proxy or "NO CONFIGURADO",
+            "hint": (
+                "HTTPS_PROXY no está en Railway → las peticiones salen sin proxy → "
+                "Binance bloqueará IPs no whitelistadas."
+                if not proxy else
+                f"El proxy está configurado ({proxy[:30]}…) pero falla la conexión. "
+                "Verifica credenciales Fixie y que el plan esté activo."
+            ),
         })
 
-    # ── Indicadores (CPU, sin red) ────────────────────────────────────────────
+    # ── Paso 2: indicadores (CPU, sin red) ───────────────────────────────────
     try:
         closes  = [float(k[4]) for k in klines]
         ema200  = _ema(closes[:-1], _EMA_PERIOD)
         atr14   = _compute_atr14(klines)
         trend   = "ALCISTA" if price > ema200 else "BAJISTA"
         gap_pct = (price - ema200) / ema200 * 100
-
         result.update({
-            "ema200":   round(ema200, 2),
-            "atr14":    round(atr14, 2),
-            "trend":    trend,
-            "gap_pct":  round(gap_pct, 2),
+            "ema200":  round(ema200, 2),
+            "atr14":   round(atr14, 2),
+            "trend":   trend,
+            "gap_pct": round(gap_pct, 2),
         })
     except Exception as exc:
         result["indicators_error"] = str(exc)
+        ema200 = price * 0.99
+        atr14  = price * 0.01
 
     # ── Paso 3: parámetros de la orden simulada ───────────────────────────────
     entry_d     = Decimal(str(round(price, 2)))
-    sl_dist     = _ATR_SL_MULT * Decimal(str(round(atr14 if "atr14" in result else price * 0.01, 8)))
+    sl_dist     = _ATR_SL_MULT * Decimal(str(round(atr14, 8)))
     stop_loss   = entry_d - sl_dist
     take_profit = entry_d + _ATR_TP_MULT * sl_dist
     stop_limit  = stop_loss * (Decimal("1") - _SL_SLIP)
 
     result.update({
-        "side":             "BUY",
-        "entry":            str(entry_d),
-        "stop_loss":        str(stop_loss.quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
-        "take_profit":      str(take_profit.quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
-        "risk_per_trade":   "1% del balance libre en USDT",
-        "rr_ratio":         "1:2",
+        "side":           "BUY",
+        "entry":          str(entry_d),
+        "stop_loss":      str(stop_loss.quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
+        "take_profit":    str(take_profit.quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
+        "risk_per_trade": "1% del balance libre en USDT",
+        "rr_ratio":       "1:2",
     })
 
     # ── Paso 4a: PAPER — registrar en DB y devolver ───────────────────────────
     if not do_live:
         msg = (
             f"[test] PAPER ORDER {sym} BUY @ {entry_d} | "
+
             f"SL={stop_loss:.2f} TP={take_profit:.2f} | "
             f"EMA200={ema200:.2f} {trend} | ATR14={atr14:.2f}"
         )
