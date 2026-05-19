@@ -8,6 +8,13 @@ Railway:
 """
 from __future__ import annotations
 
+# Load .env before anything else (local dev — no-op in Railway/production)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import asyncio
 import io
 import json
