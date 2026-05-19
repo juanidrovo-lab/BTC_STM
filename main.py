@@ -83,13 +83,10 @@ _loop_state: dict = {
     "ticks":         0,
     "signals":       0,
     "orders_placed": 0,
-    "last_tick_at":  None,   # ISO string UTC
-    "last_price":    None,
-    "last_ema200":   None,
-    "last_trend":    None,   # "BULL" | "BEAR" | "FLAT"
-    "last_gap_pct":  None,
-    "last_signal":   None,   # "BUY_CROSS" | "SELL_CROSS" | null
+    "last_tick_at":  None,
     "last_error":    None,
+    "assets":        [],       # populated from ASSETS_TO_TRADE at loop start
+    "per_symbol":    {},       # symbol → {price, ema200, trend, gap_pct, signal, tick_at}
 }
 
 # ATR multiplier for stop-loss and take-profit (gives exactly 1:2 R:R)
@@ -124,6 +121,28 @@ async def set_system_state(active: bool) -> None:
     )
 
 
+async def get_live_trading_state() -> bool:
+    """DB value overrides env var so the dashboard toggle works at runtime."""
+    try:
+        rows = await db_query("SELECT value FROM system_config WHERE key = 'live_trading' LIMIT 1")
+        if rows:
+            return str(rows[0]["value"]).lower() in ("true", "1")
+    except Exception:
+        pass
+    return os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+
+
+async def set_live_trading_state(enabled: bool) -> None:
+    await db_execute(
+        """
+        INSERT INTO system_config (key, value, updated_at)
+        VALUES ('live_trading', $1, now())
+        ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = now()
+        """,
+        "true" if enabled else "false",
+    )
+
+
 async def _log_event(event_type: str, message: str, meta: dict | None = None) -> None:
     """Write a system event to orchestrator_events (session_id = NULL for loop events)."""
     try:
@@ -141,14 +160,21 @@ async def _log_event(event_type: str, message: str, meta: dict | None = None) ->
 
 
 def _secs_to_next_candle() -> float:
-    """Seconds until 5 s after the next UTC 1h boundary.
+    """Seconds until the next loop tick.
 
-    Sleeping to the exact candle close ensures the REST klines response
-    contains the fully-closed bar before we evaluate the signal.
+    LOOP_INTERVAL_MINUTES env var controls frequency (default 5).
+    Set to 60 to align with 1h candle closes; lower values for faster local iteration.
     """
-    now        = _time.time()
-    next_hour  = (now // 3600 + 1) * 3600 + 5   # 5-second buffer after hour boundary
-    return max(next_hour - now, 1.0)
+    interval_min = int(os.environ.get("LOOP_INTERVAL_MINUTES", "5"))
+    if interval_min >= 60:
+        # Sync to 1h UTC boundary + 5 s buffer
+        now       = _time.time()
+        next_hour = (now // 3600 + 1) * 3600 + 5
+        return max(next_hour - now, 1.0)
+    interval_sec = interval_min * 60
+    now          = _time.time()
+    next_tick    = (now // interval_sec + 1) * interval_sec + 2
+    return max(next_tick - now, 1.0)
 
 
 def _compute_atr14(klines: list) -> float:
@@ -166,21 +192,12 @@ def _compute_atr14(klines: list) -> float:
 # Strategy loop core
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _strategy_tick() -> None:
-    """
-    One strategy evaluation cycle. Bandwidth budget per tick:
-
-      No signal  → 1 REST call  (~25 KB through Fixie)
-      Signal + paper → 1 REST call
-      Signal + live  → 5 REST calls  (klines + account + lot-info + limit + oco)
-
-    No WebSocket connections are opened at any point.
-    """
+async def _strategy_tick(symbol: str) -> None:
+    """One strategy evaluation cycle for a single symbol."""
     from btc_stm.exchange.binance_client import BinanceAuthError, BinanceOrderClient  # noqa: PLC0415
     from btc_stm.exchange.trade_guard import _ema, _EMA_PERIOD  # noqa: PLC0415
 
-    symbol  = os.environ.get("STRATEGY_SYMBOL", "BTCUSDT")
-    live    = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    live    = await get_live_trading_state()
     testnet = os.environ.get("BINANCE_TESTNET",    "true").lower()  != "false"
 
     # ── 1. Check kill-switch (DB, no Binance call) ────────────────────────────
@@ -188,7 +205,7 @@ async def _strategy_tick() -> None:
         log.info("[loop] system HALTED — skipping tick")
         return
 
-    # ── 2. Fetch klines  (ONE REST call through Fixie, ~25 KB) ───────────────
+    # ── 2. Fetch klines ───────────────────────────────────────────────────────
     try:
         client = await asyncio.to_thread(BinanceOrderClient.from_env)
         klines = await asyncio.to_thread(client.get_klines, symbol, "1h", 210)
@@ -220,16 +237,18 @@ async def _strategy_tick() -> None:
     signal     = "BUY_CROSS" if buy_cross else ("SELL_CROSS" if sell_cross else None)
     side       = "BUY" if buy_cross else ("SELL" if sell_cross else None)
 
-    _loop_state.update({
-        "last_tick_at": datetime.now(timezone.utc).isoformat(),
-        "last_price":   round(current, 2),
-        "last_ema200":  round(ema200, 2),
-        "last_trend":   trend,
-        "last_gap_pct": round(gap_pct, 3),
-        "last_signal":  signal,
-        "last_error":   None,
-    })
-    _loop_state["ticks"] += 1
+    tick_at = datetime.now(timezone.utc).isoformat()
+    _loop_state["last_tick_at"] = tick_at
+    _loop_state["last_error"]   = None
+    _loop_state["ticks"]       += 1
+    _loop_state["per_symbol"][symbol] = {
+        "price":    round(current, 2),
+        "ema200":   round(ema200, 2),
+        "trend":    trend,
+        "gap_pct":  round(gap_pct, 3),
+        "signal":   signal,
+        "tick_at":  tick_at,
+    }
 
     tick_msg = (f"[loop] tick {_loop_state['ticks']}: {symbol} @ ${current:.2f} | "
                 f"EMA200={ema200:.2f} | {trend} | gap={gap_pct:+.2f}% | "
@@ -341,36 +360,42 @@ async def _execute_loop_trade(
 
 async def _strategy_loop() -> None:
     """
-    Background task: wakes up once per 1h candle close (UTC-synced),
-    runs one strategy tick, then sleeps until the next candle.
-
-    Uses only REST API calls — no WebSocket connections are ever opened.
-    Proxy bandwidth consumption: ≈ 25 KB/tick × 24 ticks/day ≈ 600 KB/day.
+    Background task: wakes up every LOOP_INTERVAL_MINUTES (default 5) and
+    evaluates each asset in ASSETS_TO_TRADE independently.
     """
+    assets = [
+        s.strip().upper()
+        for s in os.environ.get("ASSETS_TO_TRADE", "BTCUSDT").split(",")
+        if s.strip()
+    ]
     _loop_state["running"] = True
-    log.info("[loop] strategy loop started — waiting for first candle close")
-    await _log_event("INFO", "[loop] strategy loop started (REST-only, 1h interval)")
+    _loop_state["assets"]  = assets
+    log.info("[loop] started — assets: %s", assets)
+    interval_min = int(os.environ.get("LOOP_INTERVAL_MINUTES", "5"))
+    await _log_event("INFO", f"[loop] iniciado — activos: {', '.join(assets)} — intervalo: {interval_min} min")
 
     while True:
         wait = _secs_to_next_candle()
-        log.info("[loop] sleeping %.0f s until next 1h candle close", wait)
+        log.info("[loop] próximo tick en %.0f s", wait)
         await asyncio.sleep(wait)
 
-        try:
-            await _strategy_tick()
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            err = f"[loop] unhandled error in tick: {exc}"
-            log.exception(err)
-            _loop_state["last_error"] = str(exc)
+        for symbol in assets:
             try:
-                await _log_event("ERROR", err)
-            except Exception:
-                pass
+                await _strategy_tick(symbol)
+            except asyncio.CancelledError:
+                _loop_state["running"] = False
+                return
+            except Exception as exc:
+                err = f"[loop] error en tick {symbol}: {exc}"
+                log.exception(err)
+                _loop_state["last_error"] = err
+                try:
+                    await _log_event("ERROR", err)
+                except Exception:
+                    pass
 
     _loop_state["running"] = False
-    log.info("[loop] strategy loop stopped")
+    log.info("[loop] detenido")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -555,16 +580,265 @@ async def migrate(request: Request, token: str = ""):
 
 @app.get("/api/strategy/status")
 async def strategy_status():
-    """Current state of the background strategy loop."""
     secs_until_next = _secs_to_next_candle() if _loop_state["running"] else None
+    live = await get_live_trading_state()
     return {
         **_loop_state,
-        "live_trading":    os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true",
-        "symbol":          os.environ.get("STRATEGY_SYMBOL", "BTCUSDT"),
+        "live_trading":    live,
         "interval":        "1h",
-        "connection_type": "REST-only",   # no WebSocket in backend
+        "connection_type": "REST-only",
         "next_tick_secs":  round(secs_until_next, 0) if secs_until_next else None,
     }
+
+
+@app.get("/api/analytics/performance")
+async def analytics_performance(symbol: str = "BTCUSDT"):
+    """Métricas de rendimiento: winrate, profit factor, PnL total para un activo."""
+    sym = symbol.strip().upper()
+    try:
+        rows = await db_query("""
+            SELECT
+                COUNT(*)::int                                                                      AS total_trades,
+                COALESCE(SUM(CASE WHEN er.realized_pnl::float >  0 THEN 1 ELSE 0 END), 0)::int   AS winning_trades,
+                COALESCE(SUM(CASE WHEN er.realized_pnl::float <  0 THEN 1 ELSE 0 END), 0)::int   AS losing_trades,
+                COALESCE(SUM(CASE WHEN er.realized_pnl::float >  0 THEN er.realized_pnl::float ELSE 0 END), 0) AS gross_profit,
+                COALESCE(SUM(CASE WHEN er.realized_pnl::float <= 0 THEN ABS(er.realized_pnl::float) ELSE 0 END), 0) AS gross_loss,
+                COALESCE(SUM(er.realized_pnl::float), 0)                                          AS total_pnl
+            FROM execution_reports er
+            WHERE er.symbol = $1
+        """, sym)
+
+        r            = rows[0] if rows else {}
+        total        = int(r.get("total_trades")   or 0)
+        winning      = int(r.get("winning_trades")  or 0)
+        losing       = int(r.get("losing_trades")   or 0)
+        gross_profit = float(r.get("gross_profit")  or 0)
+        gross_loss   = float(r.get("gross_loss")    or 0)
+        total_pnl    = float(r.get("total_pnl")     or 0)
+
+        winrate       = (winning / total * 100) if total > 0 else 0.0
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+        avg_win       = (gross_profit / winning) if winning > 0 else 0.0
+        avg_loss      = -(gross_loss  / losing)  if losing  > 0 else 0.0
+
+        pf_str = f"{profit_factor:.2f}x" if profit_factor != float("inf") else "∞"
+
+        return {
+            "symbol":          sym,
+            "total_trades":    total,
+            "winning_trades":  winning,
+            "losing_trades":   losing,
+            "winrate":         round(winrate, 1),
+            "winrate_str":     f"{winrate:.1f}%",
+            "profit_factor":   round(profit_factor, 2) if profit_factor != float("inf") else None,
+            "profit_factor_str": pf_str,
+            "total_pnl":       round(total_pnl, 2),
+            "avg_win":         round(avg_win, 2),
+            "avg_loss":        round(avg_loss, 2),
+            "gross_profit":    round(gross_profit, 2),
+            "gross_loss":      round(gross_loss, 2),
+            "source":          "neon" if total > 0 else "empty",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/strategy/toggle-live")
+async def toggle_live_trading():
+    """Toggle live/paper trading. State is persisted in system_config (overrides env var)."""
+    current   = await get_live_trading_state()
+    new_state = not current
+    await set_live_trading_state(new_state)
+    mode = "LIVE" if new_state else "PAPER"
+    msg  = f"[control] live trading switched to {mode}"
+    log.info(msg)
+    await _log_event("INFO", msg)
+    return {
+        "live_trading": new_state,
+        "mode":         mode,
+        "message":      (
+            "Live trading ENABLED — real orders will be placed on Binance"
+            if new_state else
+            "Live trading DISABLED — paper mode active, no real orders"
+        ),
+    }
+
+
+# ── Test-order endpoint ───────────────────────────────────────────────────────
+
+@app.post("/api/trade/test-order")
+async def test_order(symbol: str = "BTCUSDT", force_live: bool = False):
+    """
+    Diagnóstico end-to-end: Railway → Fixie → Binance → Neon DB.
+
+    Paso 1 — conectividad: obtiene klines del endpoint PÚBLICO de mainnet
+              (no requiere API key, no requiere whitelist de IP).
+              Esto verifica que Railway llega a Binance a través de Fixie.
+    Paso 2 — indicadores: calcula EMA-200 y ATR-14 en CPU.
+    Paso 3 — DB: escribe un evento en orchestrator_events (visible en el ConsoleCard).
+    Paso 4 — live (opcional): con force_live=true Y ENABLE_LIVE_TRADING=true,
+              ejecuta un roundtrip mínimo BUY+SELL en el exchange configurado.
+    """
+    from btc_stm.exchange.binance_client import BinanceAuthError, BinanceOrderClient  # noqa: PLC0415
+    from btc_stm.exchange.trade_guard import _ema, _EMA_PERIOD                        # noqa: PLC0415
+
+    sym     = symbol.strip().upper()
+    live    = await get_live_trading_state()
+    testnet = os.environ.get("BINANCE_TESTNET", "true").lower() != "false"
+    do_live = live and force_live
+
+    result: dict = {
+        "symbol":     sym,
+        "testnet":    testnet,
+        "mode":       "LIVE" if do_live else "PAPER",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # ── Paso 1: klines públicos de Binance (no requiere auth) ────────────────
+    try:
+        import httpx as _httpx  # noqa: PLC0415
+        async with _httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.get(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": sym, "interval": "1h", "limit": 210},
+            )
+        resp.raise_for_status()
+        klines = resp.json()
+        if not isinstance(klines, list) or len(klines) < 10:
+            raise ValueError(f"Respuesta inesperada de Binance: {str(klines)[:120]}")
+
+        price = float(klines[-1][4])
+        result.update({
+            "binance_price":  price,
+            "klines_fetched": len(klines),
+            "binance_ok":     True,
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail={
+            "message": "No se pudo obtener klines de Binance",
+            "error":   f"{type(exc).__name__}: {exc}",
+        })
+
+    # ── Paso 2: indicadores (CPU, sin red) ───────────────────────────────────
+    try:
+        closes  = [float(k[4]) for k in klines]
+        ema200  = _ema(closes[:-1], _EMA_PERIOD)
+        atr14   = _compute_atr14(klines)
+        trend   = "ALCISTA" if price > ema200 else "BAJISTA"
+        gap_pct = (price - ema200) / ema200 * 100
+        result.update({
+            "ema200":  round(ema200, 2),
+            "atr14":   round(atr14, 2),
+            "trend":   trend,
+            "gap_pct": round(gap_pct, 2),
+        })
+    except Exception as exc:
+        result["indicators_error"] = str(exc)
+        ema200 = price * 0.99
+        atr14  = price * 0.01
+
+    # ── Paso 3: parámetros de la orden simulada ───────────────────────────────
+    entry_d     = Decimal(str(round(price, 2)))
+    sl_dist     = _ATR_SL_MULT * Decimal(str(round(atr14, 8)))
+    stop_loss   = entry_d - sl_dist
+    take_profit = entry_d + _ATR_TP_MULT * sl_dist
+    stop_limit  = stop_loss * (Decimal("1") - _SL_SLIP)
+
+    result.update({
+        "side":           "BUY",
+        "entry":          str(entry_d),
+        "stop_loss":      str(stop_loss.quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
+        "take_profit":    str(take_profit.quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
+        "risk_per_trade": "1% del balance libre en USDT",
+        "rr_ratio":       "1:2",
+    })
+
+    # ── Paso 4a: PAPER — registrar en DB y devolver ───────────────────────────
+    if not do_live:
+        msg = (
+            f"[test] PAPER ORDER {sym} BUY @ {entry_d} | "
+
+            f"SL={stop_loss:.2f} TP={take_profit:.2f} | "
+            f"EMA200={ema200:.2f} {trend} | ATR14={atr14:.2f}"
+        )
+        await asyncio.to_thread(client.close)
+
+        # Prueba de escritura en Neon DB
+        try:
+            await _log_event("OK", msg, {
+                "test": True, "symbol": sym, "price": price,
+                "ema200": round(ema200, 2), "atr14": round(atr14, 2),
+            })
+            result["db_write"] = "OK — evento registrado en orchestrator_events"
+        except Exception as exc:
+            result["db_write"] = f"ERROR: {exc}"
+
+        result["order_placed"] = False
+        result["message"]      = (
+            "✓ Prueba completada en modo PAPER. "
+            "Verifica el ConsoleCard — deberías ver el evento 'OK [test] PAPER ORDER'. "
+            "Para probar una orden real usa ?force_live=true con ENABLE_LIVE_TRADING=true."
+        )
+        return result
+
+    # ── Paso 4b: LIVE — orden real mínima (BUY + SELL inmediato) ─────────────
+    try:
+        balance_f = await asyncio.to_thread(client.get_free_balance, "USDT")
+        if balance_f < 6.0:
+            raise ValueError(f"Balance insuficiente: ${balance_f:.2f} USDT (mínimo $6)")
+
+        # Cantidad mínima: lot step × ceil(minNotional / price / step)
+        lot   = await asyncio.to_thread(client.get_lot_size_filter, sym)
+        step  = Decimal(lot["stepSize"])
+        min_q = Decimal(lot["minQty"])
+        # Apuntar a $6 de valor nocional
+        target_qty = Decimal("6") / Decimal(str(price))
+        qty = max(
+            (target_qty / step).to_integral_value(ROUND_DOWN) * step,
+            min_q,
+        )
+        result["quantity"] = str(qty)
+        result["notional"] = f"~${float(qty) * price:.2f} USDT"
+
+        # BUY de mercado
+        buy_res = await asyncio.to_thread(
+            client.place_market_order, sym, "BUY", str(qty)
+        )
+        result["buy_order"] = {
+            "orderId": buy_res.get("orderId"),
+            "status":  buy_res.get("status"),
+        }
+
+        # SELL de mercado inmediato (cierra la posición)
+        sell_res = await asyncio.to_thread(
+            client.place_market_order, sym, "SELL", str(qty)
+        )
+        result["sell_order"] = {
+            "orderId": sell_res.get("orderId"),
+            "status":  sell_res.get("status"),
+        }
+
+        result["order_placed"] = True
+        ok_msg = (
+            f"[test] LIVE ROUNDTRIP {sym} qty={qty} notional={result['notional']} "
+            f"BUY={buy_res.get('orderId')} SELL={sell_res.get('orderId')} "
+            f"network={'TESTNET' if testnet else 'MAINNET'}"
+        )
+        await _log_event("OK", ok_msg, {"test": True, "live": True, "symbol": sym})
+        result["db_write"] = "OK"
+        result["message"]  = (
+            f"✓ Roundtrip real completado en {'TESTNET' if testnet else 'MAINNET'}. "
+            "Verifica el ConsoleCard y el historial de órdenes en Binance."
+        )
+
+    except Exception as exc:
+        result["order_placed"] = False
+        result["order_error"]  = str(exc)
+        await _log_event("ERROR", f"[test] LIVE ORDER FAILED {sym}: {exc}", {"test": True})
+    finally:
+        await asyncio.to_thread(client.close)
+
+    return result
 
 
 # ── Portfolio metrics ─────────────────────────────────────────────────────────
