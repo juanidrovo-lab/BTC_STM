@@ -1,180 +1,252 @@
 'use client'
 
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { GlassCard } from './GlassCard'
-import { TrendingUp, TrendingDown, BarChart2, RefreshCw } from 'lucide-react'
-import { useEffect, useState, useCallback } from 'react'
+import { TrendingUp, TrendingDown, RefreshCw, CandlestickChart } from 'lucide-react'
 
-interface KlineBar {
-  pct:    number
-  label:  string
-  volume: string
-  close:  number
-  open:   number
+interface PriceStats {
+  last:    number
+  open24h: number
+  high24h: number
+  low24h:  number
+  vol24h:  number
+  pct24h:  number
 }
 
-// Fallback deterministic bars while loading
-const FALLBACK_RAW = [42,58,35,71,88,52,63,45,79,93,67,48,82,56,70,44,86,61,73,39,95,54,68,47,84,60,76,43,89,65]
-
-function buildFallback(): KlineBar[] {
-  const max = Math.max(...FALLBACK_RAW)
-  return FALLBACK_RAW.map((v, i) => ({
-    pct:    Math.round((v / max) * 100),
-    label:  `${String(17 + Math.floor(i / 2)).padStart(2, '0')}:${i % 2 === 0 ? '00' : '30'}`,
-    volume: (v * 0.23 + 12).toFixed(2),
-    close:  0,
-    open:   0,
-  }))
+interface Props {
+  symbol?: string  // e.g. "BTCUSDT"
 }
 
-function parseBinanceKlines(raw: number[][]): KlineBar[] {
-  if (!raw.length) return buildFallback()
-  const closes = raw.map(k => parseFloat(String(k[4])))
-  const volumes = raw.map(k => parseFloat(String(k[5])))
-  const maxVol = Math.max(...volumes) || 1
-  return raw.map((k, i) => {
-    const open  = parseFloat(String(k[1]))
-    const close = parseFloat(String(k[4]))
-    const vol   = parseFloat(String(k[5]))
-    const ts    = new Date(k[0])
-    const hh    = String(ts.getHours()).padStart(2, '0')
-    const mm    = String(ts.getMinutes()).padStart(2, '0')
-    return {
-      pct:    Math.max(4, Math.round((vol / maxVol) * 100)),
-      label:  `${hh}:${mm}`,
-      volume: vol.toFixed(2),
-      close,
-      open,
-    }
-  })
-}
+export function ActivityChart({ symbol = 'BTCUSDT' }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const chartRef     = useRef<any>(null)
+  const candleRef    = useRef<any>(null)
+  const volRef       = useRef<any>(null)
+  const symbolRef    = useRef(symbol)
 
-interface BarProps { bar: KlineBar; index: number; total: number }
+  const [stats,   setStats]   = useState<PriceStats | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error,   setError]   = useState<string | null>(null)
 
-function Bar({ bar, index, total }: BarProps) {
-  const [hovered, setHovered] = useState(false)
-  const bullish = bar.close >= bar.open || bar.close === 0
-  return (
-    <div
-      className="group relative flex flex-1 flex-col items-center justify-end gap-1"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-    >
-      {hovered && (
-        <div className="absolute -top-10 left-1/2 -translate-x-1/2 z-10 whitespace-nowrap rounded-lg bg-slate-800 border border-white/10 px-2.5 py-1 text-[10px] font-mono text-cyan-400 shadow-xl">
-          {bar.volume} BTC
-        </div>
-      )}
-      <div
-        className="relative w-full origin-bottom rounded-t-sm transition-all duration-300 ease-out"
-        style={{
-          height: `${bar.pct}%`,
-          background: hovered
-            ? bullish
-              ? 'linear-gradient(to top, rgba(6,182,212,0.5), rgba(34,211,238,0.8))'
-              : 'linear-gradient(to top, rgba(239,68,68,0.5), rgba(248,113,113,0.8))'
-            : bullish
-              ? 'linear-gradient(to top, rgba(6,182,212,0.15), rgba(34,211,238,0.45))'
-              : 'linear-gradient(to top, rgba(239,68,68,0.1), rgba(248,113,113,0.3))',
-          boxShadow: hovered ? `0 0 12px ${bullish ? 'rgba(6,182,212,0.4)' : 'rgba(239,68,68,0.3)'}` : 'none',
-        }}
-      />
-      {index % Math.ceil(total / 6) === 0 && (
-        <span className="absolute -bottom-5 text-[9px] font-mono text-slate-600 whitespace-nowrap">
-          {bar.label}
-        </span>
-      )}
-    </div>
-  )
-}
-
-export function ActivityChart() {
-  const [bars, setBars]         = useState<KlineBar[]>(buildFallback())
-  const [loading, setLoading]   = useState(true)
-  const [change24h, setChange]  = useState<{ pct: string; up: boolean } | null>(null)
-  const [avgVol, setAvgVol]     = useState('—')
-  const [peakVol, setPeakVol]   = useState('—')
-
-  const fetchKlines = useCallback(async () => {
+  // ── Fetch klines y actualizar series ─────────────────────────────────────
+  const fetchAndUpdate = useCallback(async (sym: string) => {
     try {
-      const res  = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=30')
-      const data: number[][] = await res.json()
-      const parsed = parseBinanceKlines(data)
-      setBars(parsed)
+      const res = await fetch(
+        `https://api.binance.com/api/v3/klines?symbol=${sym}&interval=1h&limit=200`
+      )
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const raw: string[][] = await res.json()
 
-      // Stats
-      const vols = data.map(k => parseFloat(String(k[5])))
-      setAvgVol((vols.reduce((a, b) => a + b, 0) / vols.length).toFixed(1))
-      setPeakVol(Math.max(...vols).toFixed(1))
+      const candles = raw.map(k => ({
+        time:  Math.floor(Number(k[0]) / 1000) as any,
+        open:  parseFloat(k[1]),
+        high:  parseFloat(k[2]),
+        low:   parseFloat(k[3]),
+        close: parseFloat(k[4]),
+      }))
+      const volumes = raw.map(k => {
+        const bull = parseFloat(k[4]) >= parseFloat(k[1])
+        return {
+          time:  Math.floor(Number(k[0]) / 1000) as any,
+          value: parseFloat(k[5]),
+          color: bull ? 'rgba(16,185,129,0.45)' : 'rgba(244,63,94,0.45)',
+        }
+      })
 
-      // 24h change from ticker
-      const t = await fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT')
-      const td = await t.json()
-      const pct = parseFloat(td.priceChangePercent)
-      setChange({ pct: `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`, up: pct >= 0 })
+      if (candleRef.current) candleRef.current.setData(candles)
+      if (volRef.current)    volRef.current.setData(volumes)
+      if (chartRef.current)  chartRef.current.timeScale().fitContent()
+
+      const last  = candles[candles.length - 1]
+      const first = candles[0]
+      const vols  = raw.map(k => parseFloat(k[5]))
+      const highs = raw.map(k => parseFloat(k[2]))
+      const lows  = raw.map(k => parseFloat(k[3]))
+      setStats({
+        last:    last.close,
+        open24h: first.open,
+        high24h: Math.max(...highs),
+        low24h:  Math.min(...lows),
+        vol24h:  vols.reduce((a, b) => a + b, 0),
+        pct24h:  ((last.close - first.open) / first.open) * 100,
+      })
+      setError(null)
     } catch {
-      // keep fallback bars
+      setError('No se pudo cargar el gráfico')
     } finally {
       setLoading(false)
     }
   }, [])
 
+  // ── Construir gráfico al montar ───────────────────────────────────────────
   useEffect(() => {
-    fetchKlines()
-    const id = setInterval(fetchKlines, 60_000)
+    const el = containerRef.current
+    if (!el) return
+
+    import('lightweight-charts').then(({ createChart, ColorType, CrosshairMode }) => {
+      const chart = createChart(el, {
+        layout: {
+          background: { type: ColorType.Solid, color: 'transparent' },
+          textColor:  '#475569',
+          fontSize:   11,
+        },
+        grid: {
+          vertLines: { color: 'rgba(255,255,255,0.03)' },
+          horzLines: { color: 'rgba(255,255,255,0.03)' },
+        },
+        crosshair: {
+          mode:     CrosshairMode.Normal,
+          vertLine: { color: 'rgba(100,216,255,0.35)', labelBackgroundColor: '#0f172a' },
+          horzLine: { color: 'rgba(100,216,255,0.35)', labelBackgroundColor: '#0f172a' },
+        },
+        rightPriceScale: {
+          borderColor:  'rgba(255,255,255,0.06)',
+          textColor:    '#475569',
+          scaleMargins: { top: 0.05, bottom: 0.22 },
+        },
+        timeScale: {
+          borderColor:    'rgba(255,255,255,0.06)',
+          timeVisible:    true,
+          secondsVisible: false,
+        },
+        handleScroll: true,
+        handleScale:  true,
+        width:  el.clientWidth,
+        height: el.clientHeight,
+      })
+
+      const candle = chart.addCandlestickSeries({
+        upColor:         '#10b981',
+        downColor:       '#f43f5e',
+        borderUpColor:   '#10b981',
+        borderDownColor: '#f43f5e',
+        wickUpColor:     '#6ee7b7',
+        wickDownColor:   '#fca5a5',
+      })
+
+      const vol = chart.addHistogramSeries({
+        priceFormat:  { type: 'volume' },
+        priceScaleId: 'vol',
+      })
+      chart.priceScale('vol').applyOptions({
+        scaleMargins:  { top: 0.78, bottom: 0 },
+        ticksVisible:  false,
+        borderVisible: false,
+      })
+
+      chartRef.current  = chart
+      candleRef.current = candle
+      volRef.current    = vol
+
+      fetchAndUpdate(symbolRef.current)
+
+      const ro = new ResizeObserver(() => {
+        if (el) chart.applyOptions({ width: el.clientWidth, height: el.clientHeight })
+      })
+      ro.observe(el)
+      ;(chart as any).__ro = ro
+    })
+
+    return () => {
+      ;(chartRef.current as any)?.__ro?.disconnect()
+      chartRef.current?.remove()
+      chartRef.current  = null
+      candleRef.current = null
+      volRef.current    = null
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // ── Recargar cuando cambia el símbolo ────────────────────────────────────
+  useEffect(() => {
+    symbolRef.current = symbol
+    setLoading(true)
+    setStats(null)
+    if (candleRef.current) fetchAndUpdate(symbol)
+  }, [symbol, fetchAndUpdate])
+
+  // ── Poll REST cada 60 s (sin WebSocket) ───────────────────────────────────
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (candleRef.current) fetchAndUpdate(symbolRef.current)
+    }, 60_000)
     return () => clearInterval(id)
-  }, [fetchKlines])
+  }, [fetchAndUpdate])
+
+  const up   = (stats?.pct24h ?? 0) >= 0
+  const sign = up ? '+' : ''
+  const base = symbol.replace('USDT', '')
 
   return (
     <GlassCard glow="cyan" padding={false} className="flex flex-col">
-      {/* Header */}
-      <div className="flex items-start justify-between p-6 pb-4">
+
+      {/* ── Cabecera ── */}
+      <div className="flex items-start justify-between p-5 pb-3 flex-shrink-0">
         <div>
-          <p className="label-xs mb-1.5">Trading Activity</p>
-          <div className="flex items-baseline gap-2">
-            <h2 className="text-3xl font-light tracking-tight text-slate-100">BTCUSDT</h2>
-            {change24h && (
-              <span className={`flex items-center gap-1 text-sm font-medium ${change24h.up ? 'text-emerald-400' : 'text-red-400'}`}>
-                {change24h.up ? <TrendingUp className="h-3.5 w-3.5" /> : <TrendingDown className="h-3.5 w-3.5" />}
-                {change24h.pct}
+          <p className="label-xs mb-1">Gráfico de Velas · {symbol} · 1h</p>
+          <div className="flex items-baseline gap-3">
+            <span className="text-2xl font-light tracking-tight text-slate-100 font-mono">
+              {stats
+                ? `$${stats.last.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                : '—'}
+            </span>
+            {stats && (
+              <span className={`flex items-center gap-1 text-sm font-medium ${up ? 'text-emerald-400' : 'text-red-400'}`}>
+                {up ? <TrendingUp className="h-3.5 w-3.5" /> : <TrendingDown className="h-3.5 w-3.5" />}
+                {sign}{stats.pct24h.toFixed(2)}%
               </span>
             )}
           </div>
-          <p className="mt-0.5 text-sm text-slate-500">Last 30 hours · 1h bars · Binance</p>
         </div>
-        <div className="flex items-center gap-2 rounded-lg bg-cyan-500/10 border border-cyan-500/20 px-3 py-1.5">
-          {loading
-            ? <RefreshCw className="h-3.5 w-3.5 text-cyan-400 animate-spin" />
-            : <BarChart2  className="h-3.5 w-3.5 text-cyan-400" />
-          }
-          <span className="text-xs font-medium text-cyan-400">LIVE</span>
-          <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-blink" />
-        </div>
-      </div>
 
-      <div className="mx-6 h-px bg-gradient-to-r from-transparent via-white/[0.06] to-transparent" />
+        <div className="flex items-center gap-3">
+          {stats && (
+            <div className="hidden sm:flex gap-4">
+              {[
+                { label: 'MAX', value: `$${stats.high24h.toLocaleString('en-US', { maximumFractionDigits: 0 })}`, cls: 'text-emerald-400' },
+                { label: 'MÍN', value: `$${stats.low24h.toLocaleString('en-US',  { maximumFractionDigits: 0 })}`, cls: 'text-red-400'     },
+                { label: 'VOL', value: `${stats.vol24h.toFixed(0)} ${base}`,                                       cls: 'text-slate-400'  },
+              ].map(({ label, value, cls }) => (
+                <div key={label} className="text-right">
+                  <p className="text-[9px] text-slate-600 uppercase tracking-wider">{label}</p>
+                  <p className={`text-xs font-mono font-medium ${cls}`}>{value}</p>
+                </div>
+              ))}
+            </div>
+          )}
 
-      {/* Chart */}
-      <div className="flex-1 px-6 pt-4 pb-8">
-        <div className="flex h-full items-end gap-[3px]">
-          {bars.map((b, i) => (
-            <Bar key={i} bar={b} index={i} total={bars.length} />
-          ))}
-        </div>
-      </div>
-
-      {/* Stats row */}
-      <div className="grid grid-cols-3 divide-x divide-white/[0.06] border-t border-white/[0.06]">
-        {[
-          { label: 'Avg Volume', value: avgVol === '—' ? '—' : `${avgVol} BTC` },
-          { label: 'Peak',       value: peakVol === '—' ? '—' : `${peakVol} BTC` },
-          { label: 'Interval',   value: '1h · 30 bars' },
-        ].map(({ label, value }) => (
-          <div key={label} className="px-6 py-3 text-center">
-            <p className="label-xs mb-0.5">{label}</p>
-            <p className="text-sm font-medium text-slate-200">{value}</p>
+          <div className="flex items-center gap-1.5 rounded-lg bg-cyan-500/10 border border-cyan-500/20 px-2.5 py-1.5">
+            {loading
+              ? <RefreshCw className="h-3.5 w-3.5 text-cyan-400 animate-spin" />
+              : <CandlestickChart className="h-3.5 w-3.5 text-cyan-400" />}
+            <span className="text-[11px] font-medium text-cyan-400 tracking-wide">
+              {error ? 'ERROR' : 'VIVO'}
+            </span>
+            {!error && <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />}
           </div>
-        ))}
+        </div>
       </div>
+
+      <div className="mx-5 h-px bg-gradient-to-r from-transparent via-white/[0.05] to-transparent flex-shrink-0" />
+
+      {/* ── Gráfico ── */}
+      <div className="relative flex-1 min-h-0">
+        {error && (
+          <div className="absolute inset-0 flex items-center justify-center z-10">
+            <div className="text-center">
+              <p className="text-sm text-slate-500">{error}</p>
+              <button
+                onClick={() => fetchAndUpdate(symbolRef.current)}
+                className="mt-2 text-xs text-cyan-400 hover:text-cyan-300 underline"
+              >
+                Reintentar
+              </button>
+            </div>
+          </div>
+        )}
+        <div ref={containerRef} className="absolute inset-0" />
+      </div>
+
     </GlassCard>
   )
 }

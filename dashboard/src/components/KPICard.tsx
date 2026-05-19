@@ -33,30 +33,30 @@ const iconMap = {
 function kpiList(m: PortfolioMetrics) {
   return [
     {
-      label:     'Total Return',
+      label:     'Retorno Total',
       value:     m.total_return_str,
       subtext:   `Equity $${m.current_equity.toLocaleString()}`,
       direction: (m.total_return >= 0 ? 'up' : 'down') as 'up' | 'down',
       color:     m.total_return >= 0 ? 'emerald' : 'red',
     },
     {
-      label:     'Max Drawdown',
+      label:     'Drawdown Máximo',
       value:     m.max_drawdown_str,
-      subtext:   'Peak to trough',
+      subtext:   'Pico a valle',
       direction: 'down' as const,
       color:     'red',
     },
     {
-      label:     'Win Rate',
+      label:     'Tasa de Aciertos',
       value:     m.win_rate_str,
-      subtext:   `${m.total_trades} total trades`,
+      subtext:   `${m.total_trades} operaciones`,
       direction: (m.win_rate >= 50 ? 'up' : 'down') as 'up' | 'down',
       color:     'cyan',
     },
     {
-      label:     'Sharpe Ratio',
+      label:     'Ratio de Sharpe',
       value:     m.sharpe_str,
-      subtext:   'Risk-adjusted',
+      subtext:   'Ajustado al riesgo',
       direction: 'neutral' as const,
       color:     'slate',
     },
@@ -76,7 +76,7 @@ const EMPTY_METRICS: PortfolioMetrics = {
 export function KPICard() {
   const [metrics, setMetrics] = useState<PortfolioMetrics | null>(null)
   const [loading, setLoading] = useState(true)
-  const [error, setError]     = useState(false)
+  const [error,   setError]   = useState(false)
 
   const fetch_ = useCallback(async () => {
     try {
@@ -104,18 +104,16 @@ export function KPICard() {
 
   return (
     <GlassCard glow="cyan" padding={false} className="flex flex-col">
-      {/* Header */}
       <div className="p-6 pb-4 flex items-start justify-between">
         <div>
-          <p className="label-xs mb-1.5">Performance KPIs</p>
-          <h2 className="text-lg font-medium text-slate-100">Portfolio Metrics</h2>
+          <p className="label-xs mb-1.5">Indicadores Clave</p>
+          <h2 className="text-lg font-medium text-slate-100">Métricas de Cartera</h2>
         </div>
         {loading && <RefreshCw className="h-4 w-4 text-slate-600 animate-spin mt-1" />}
       </div>
 
       <div className="mx-6 h-px bg-gradient-to-r from-transparent via-white/[0.06] to-transparent" />
 
-      {/* KPI grid */}
       <div className="flex-1 grid grid-cols-2 gap-3 p-4">
         {kpis.map(({ label, value, subtext, direction, color }) => {
           const c = colorMap[color as keyof typeof colorMap]
@@ -135,7 +133,7 @@ export function KPICard() {
                 {value}
               </p>
               <p className="mt-1 text-[10px] text-slate-600">
-                {error ? 'API error' : isEmpty ? 'No sessions yet' : subtext}
+                {error ? 'Error de API' : isEmpty ? 'Sin sesiones aún' : subtext}
               </p>
             </div>
           )

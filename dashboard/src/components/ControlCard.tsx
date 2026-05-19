@@ -49,15 +49,19 @@ export function ControlCard() {
 
   const actions: Action[] = [
     {
-      id: 'backtest', label: 'Run Backtest', sub: 'Execute strategy simulation',
+      id: 'backtest', label: 'Ejecutar Backtest', sub: 'Simular estrategia en histórico',
       icon: Play, color: 'cyan',
       call: async () => {
-        const res = await fetch('/api/backtest', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bars: 100 }) })
+        const res = await fetch('/api/backtest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bars: 100 }),
+        })
         if (!res.ok) throw new Error()
       },
     },
     {
-      id: 'health', label: 'Health Check', sub: 'Ping /api/health endpoint',
+      id: 'health', label: 'Chequeo de Salud', sub: 'Ping a /api/health',
       icon: Activity, color: 'emerald',
       call: async () => {
         const res = await fetch('/api/health')
@@ -65,7 +69,7 @@ export function ControlCard() {
       },
     },
     {
-      id: 'migrate', label: 'Run Migration', sub: 'Apply Alembic head schema',
+      id: 'migrate', label: 'Ejecutar Migración', sub: 'Aplicar esquema Alembic',
       icon: Database, color: 'cyan',
       call: async () => {
         const res = await fetch('/api/migrate?token=btcstm2026', { method: 'POST' })
@@ -73,24 +77,22 @@ export function ControlCard() {
       },
     },
     {
-      id: 'export',   label: 'Export Data',    sub: 'Download session CSV',     icon: Download,       color: 'emerald' },
+      id: 'export',   label: 'Exportar Datos',     sub: 'Descargar CSV de sesión',   icon: Download,      color: 'emerald' },
     {
-      id: 'refresh',  label: 'Sync Positions', sub: 'Reload from Neon DB',      icon: RefreshCw,      color: 'slate'   },
+      id: 'refresh',  label: 'Sincronizar',         sub: 'Recargar desde Neon DB',    icon: RefreshCw,     color: 'slate'   },
     {
-      id: 'alert',    label: 'Risk Override',  sub: 'Bypass risk limits (dev)', icon: AlertTriangle,  color: 'amber',  danger: true },
+      id: 'alert',    label: 'Override de Riesgo',  sub: 'Bypasear límites (dev)',    icon: AlertTriangle, color: 'amber', danger: true },
   ]
 
   return (
     <GlassCard glow="emerald" padding={false} className="flex flex-col">
-      {/* Header */}
       <div className="p-6 pb-4">
-        <p className="label-xs mb-1.5">Control Panel</p>
-        <h2 className="text-lg font-medium text-slate-100">System Actions</h2>
+        <p className="label-xs mb-1.5">Panel de Control</p>
+        <h2 className="text-lg font-medium text-slate-100">Acciones del Sistema</h2>
       </div>
 
       <div className="mx-6 h-px bg-gradient-to-r from-transparent via-white/[0.06] to-transparent" />
 
-      {/* Actions grid */}
       <div className="flex-1 grid grid-cols-2 gap-2.5 p-4">
         {actions.map((action) => {
           const { id, label, sub, icon: Icon, color, danger } = action
@@ -142,9 +144,8 @@ export function ControlCard() {
         })}
       </div>
 
-      {/* Status bar */}
       <div className="border-t border-white/[0.06] px-6 py-2.5 flex items-center justify-between">
-        <span className="label-xs">Operator</span>
+        <span className="label-xs">Operador</span>
         <span className="text-[10px] font-mono text-slate-500">root@btc-stm-prod</span>
       </div>
     </GlassCard>
