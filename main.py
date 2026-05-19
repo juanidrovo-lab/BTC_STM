@@ -160,14 +160,20 @@ async def _log_event(event_type: str, message: str, meta: dict | None = None) ->
 
 
 def _secs_to_next_candle() -> float:
-    """Seconds until 5 s after the next UTC 1h boundary.
+    """Seconds until the next loop tick.
 
-    Sleeping to the exact candle close ensures the REST klines response
-    contains the fully-closed bar before we evaluate the signal.
+    LOOP_INTERVAL_MINUTES env var controls frequency (default 5).
+    Set to 60 to align with 1h candle closes; lower values for faster local iteration.
     """
-    now        = _time.time()
-    next_hour  = (now // 3600 + 1) * 3600 + 5   # 5-second buffer after hour boundary
-    return max(next_hour - now, 1.0)
+    interval_min = int(os.environ.get("LOOP_INTERVAL_MINUTES", "5"))
+    if interval_min >= 60:
+        now       = _time.time()
+        next_hour = (now // 3600 + 1) * 3600 + 5
+        return max(next_hour - now, 1.0)
+    interval_sec = interval_min * 60
+    now          = _time.time()
+    next_tick    = (now // interval_sec + 1) * interval_sec + 2
+    return max(next_tick - now, 1.0)
 
 
 def _compute_atr14(klines: list) -> float:
@@ -186,12 +192,7 @@ def _compute_atr14(klines: list) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _strategy_tick(symbol: str) -> None:
-    """
-    One strategy evaluation cycle for a single symbol.
-
-    Bandwidth: 1 REST call/tick (~25 KB). Extra calls only on signal + live.
-    No WebSocket connections are ever opened.
-    """
+    """One strategy evaluation cycle for a single symbol."""
     from btc_stm.exchange.binance_client import BinanceAuthError, BinanceOrderClient  # noqa: PLC0415
     from btc_stm.exchange.trade_guard import _ema, _EMA_PERIOD  # noqa: PLC0415
 
@@ -203,7 +204,7 @@ async def _strategy_tick(symbol: str) -> None:
         log.info("[loop] system HALTED — skipping tick")
         return
 
-    # ── 2. Fetch klines  (ONE REST call through Fixie, ~25 KB) ───────────────
+    # ── 2. Fetch klines ───────────────────────────────────────────────────────
     try:
         client = await asyncio.to_thread(BinanceOrderClient.from_env)
         klines = await asyncio.to_thread(client.get_klines, symbol, "1h", 210)
@@ -358,25 +359,23 @@ async def _execute_loop_trade(
 
 async def _strategy_loop() -> None:
     """
-    Background task: wakes up once per 1h candle close (UTC-synced) and
+    Background task: wakes up every LOOP_INTERVAL_MINUTES (default 5) and
     evaluates each asset in ASSETS_TO_TRADE independently.
-
-    REST-only — no WebSockets.
-    Bandwidth: ≈ 25 KB × n_assets × 24 ticks/day.
     """
     assets = [
         s.strip().upper()
         for s in os.environ.get("ASSETS_TO_TRADE", "BTCUSDT").split(",")
         if s.strip()
     ]
+    interval_min = int(os.environ.get("LOOP_INTERVAL_MINUTES", "5"))
     _loop_state["running"] = True
     _loop_state["assets"]  = assets
-    log.info("[loop] started — assets: %s", assets)
-    await _log_event("INFO", f"[loop] iniciado — activos: {', '.join(assets)} (REST-only, 1h)")
+    log.info("[loop] started — assets: %s — interval: %d min", assets, interval_min)
+    await _log_event("INFO", f"[loop] iniciado — activos: {', '.join(assets)} — intervalo: {interval_min} min")
 
     while True:
         wait = _secs_to_next_candle()
-        log.info("[loop] durmiendo %.0f s hasta próximo cierre de vela", wait)
+        log.info("[loop] próximo tick en %.0f s", wait)
         await asyncio.sleep(wait)
 
         for symbol in assets:
@@ -694,16 +693,10 @@ async def test_order(symbol: str = "BTCUSDT", force_live: bool = False):
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    # ── Paso 1: klines desde mainnet público (no necesita auth ni IP whitelist) ─
-    # Siempre usamos mainnet para este paso; testnet es inestable y el endpoint
-    # de klines es público. El proxy Fixie DEBE estar en la ruta para que funcione.
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    result["proxy_configured"] = bool(proxy)
-
+    # ── Paso 1: klines públicos de Binance (no requiere auth) ────────────────
     try:
         import httpx as _httpx  # noqa: PLC0415
-        proxy_kwargs = {"proxy": proxy} if proxy else {}
-        async with _httpx.AsyncClient(timeout=10.0, **proxy_kwargs) as http:
+        async with _httpx.AsyncClient(timeout=10.0) as http:
             resp = await http.get(
                 "https://api.binance.com/api/v3/klines",
                 params={"symbol": sym, "interval": "1h", "limit": 210},
@@ -717,23 +710,12 @@ async def test_order(symbol: str = "BTCUSDT", force_live: bool = False):
         result.update({
             "binance_price":  price,
             "klines_fetched": len(klines),
-            "fixie_ok":       True,
-            "proxy_used":     proxy or "sin proxy (directo)",
+            "binance_ok":     True,
         })
     except Exception as exc:
-        result["fixie_ok"] = False
         raise HTTPException(status_code=502, detail={
-            "message":          "No se pudo obtener klines de Binance",
-            "error":            f"{type(exc).__name__}: {exc}",
-            "proxy_configured": bool(proxy),
-            "proxy_url":        proxy or "NO CONFIGURADO",
-            "hint": (
-                "HTTPS_PROXY no está en Railway → las peticiones salen sin proxy → "
-                "Binance bloqueará IPs no whitelistadas."
-                if not proxy else
-                f"El proxy está configurado ({proxy[:30]}…) pero falla la conexión. "
-                "Verifica credenciales Fixie y que el plan esté activo."
-            ),
+            "message": "No se pudo obtener klines de Binance",
+            "error":   f"{type(exc).__name__}: {exc}",
         })
 
     # ── Paso 2: indicadores (CPU, sin red) ───────────────────────────────────
