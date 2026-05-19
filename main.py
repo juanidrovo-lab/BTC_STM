@@ -647,6 +647,12 @@ async def toggle_live_trading():
     """Toggle live/paper trading. State is persisted in system_config (overrides env var)."""
     current   = await get_live_trading_state()
     new_state = not current
+
+    if new_state and os.environ.get("ENABLE_LIVE_TRADING", "false").lower() != "true":
+        raise HTTPException(
+            status_code=403,
+            detail="ENABLE_LIVE_TRADING=true no está en el .env — edítalo y reinicia el backend para permitir live trading.",
+        )
     await set_live_trading_state(new_state)
     mode = "LIVE" if new_state else "PAPER"
     msg  = f"[control] live trading switched to {mode}"
@@ -668,11 +674,9 @@ async def toggle_live_trading():
 @app.post("/api/trade/test-order")
 async def test_order(symbol: str = "BTCUSDT", force_live: bool = False):
     """
-    Diagnóstico end-to-end: Railway → Fixie → Binance → Neon DB.
+    Diagnóstico end-to-end: backend → Binance → Neon DB.
 
-    Paso 1 — conectividad: obtiene klines del endpoint PÚBLICO de mainnet
-              (no requiere API key, no requiere whitelist de IP).
-              Esto verifica que Railway llega a Binance a través de Fixie.
+    Paso 1 — conectividad: obtiene klines públicos de Binance (sin auth).
     Paso 2 — indicadores: calcula EMA-200 y ATR-14 en CPU.
     Paso 3 — DB: escribe un evento en orchestrator_events (visible en el ConsoleCard).
     Paso 4 — live (opcional): con force_live=true Y ENABLE_LIVE_TRADING=true,
